@@ -1,4 +1,4 @@
-"""Petits composants de l'interface : disposition fluide, sélecteur numérique, infobulles."""
+"""Petits composants de l'interface : disposition fluide, sélecteurs, infobulles."""
 
 import tkinter as tk
 from tkinter import ttk
@@ -83,6 +83,38 @@ class Stepper(ttk.Frame):
                 self.command()
         self.minus.state(["disabled" if value <= self.lo else "!disabled"])
         self.plus.state(["disabled" if value >= self.hi else "!disabled"])
+
+
+class ChoiceStepper(ttk.Frame):
+    """Choix parmi une liste de valeurs (libellés dans `variable`), réglé avec − et + ou la molette."""
+
+    def __init__(self, master, variable, labels, command=None, width=9, **kw):
+        super().__init__(master, **kw)
+        self.var, self.labels, self.command = variable, list(labels), command
+        self.minus = ttk.Button(self, text="−", width=2, style="Icon.TButton", command=lambda: self.step(-1))
+        value = ttk.Label(self, textvariable=variable, width=width, anchor="center", style="Value.TLabel")
+        self.plus = ttk.Button(self, text="+", width=2, style="Icon.TButton", command=lambda: self.step(1))
+        self.minus.grid(row=0, column=0)
+        value.grid(row=0, column=1)
+        self.plus.grid(row=0, column=2)
+        for widget in (self, value, self.minus, self.plus):
+            widget.bind("<MouseWheel>", lambda e: self.step(1 if e.delta > 0 else -1))
+        self.step(0)
+
+    def index(self):
+        try:
+            return self.labels.index(self.var.get())
+        except ValueError:
+            return 0
+
+    def step(self, delta):
+        i = max(0, min(len(self.labels) - 1, self.index() + delta))
+        if self.labels[i] != self.var.get():
+            self.var.set(self.labels[i])
+            if self.command:
+                self.command()
+        self.minus.state(["disabled" if i <= 0 else "!disabled"])
+        self.plus.state(["disabled" if i >= len(self.labels) - 1 else "!disabled"])
 
 
 class Tooltip:

@@ -2,6 +2,7 @@
 
 import json
 import os
+import secrets
 
 from .paths import CONFIG_PATH
 
@@ -12,7 +13,10 @@ DEFAULTS = {
     "watch": True,       # surveiller le presse-papier
     "scan": True,        # analyse VirusTotal quand toute la liste est téléchargée
     "extract": True,     # puis extraction WinRAR
+    "max_speed": 0,      # débit total maximal en Mo/s (0 = illimité)
+    "notify": True,      # notifications Windows (captcha à valider, liste terminée…)
     "theme": "system",   # apparence : system (celle de Windows), light ou dark
+    "token": "",         # secret partagé avec le userscript, généré au premier lancement
 }
 
 
@@ -21,9 +25,12 @@ def load():
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        cfg.update({k: v for k, v in data.items() if k in DEFAULTS})
-    except (OSError, ValueError):
+        cfg.update({k: v for k, v in data.items() if k in DEFAULTS and type(v) is type(DEFAULTS[k])})
+    except (OSError, ValueError, AttributeError):
         pass
+    if len(cfg["token"]) < 32:
+        cfg["token"] = secrets.token_urlsafe(32)
+        save(cfg)
     return cfg
 
 

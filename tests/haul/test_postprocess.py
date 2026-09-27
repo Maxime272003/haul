@@ -6,12 +6,22 @@ from types import SimpleNamespace
 
 import pytest
 
-from haul.engine import Job
-from haul.postprocess import ScanReport, archive_sets, extract, find_winrar
+from haul import postprocess
+from haul.engine import Job, State
+from haul.postprocess import (
+    ExtractionBlocked,
+    ScanReport,
+    archive_sets,
+    extract,
+    extraction_dir,
+    find_winrar,
+    prepare_extraction,
+    unsafe_entry,
+)
 
 
 def job(dest, name, i=0):
-    return Job(i, f"https://fuckingfast.co/x{i}", str(dest), name=name, status="Terminé")
+    return Job(i, f"https://fuckingfast.co/x{i}", str(dest), name=name, state=State.DONE)
 
 
 def test_archive_sets_groups_volumes_and_finds_first_volume_on_disk(tmp_path):
@@ -64,3 +74,47 @@ def test_extract_multivolume_and_overwrite(tmp_path):
 
     assert extract(find_winrar(), str(dest / "Jeu.part1.rar")) == 0
     assert (dest / "Jeu" / "setup.exe").read_bytes() == payload
+
+
+def test_unsafe_entries():
+    for name in (r"..\x.exe", r"Jeu\..\..\x.exe", "/etc/x", r"C:\Windows\x.exe", r"setup.exe:..\..\x.lnk"):
+        assert unsafe_entry(name), name
+    for name in (r"Jeu\setup.exe", "Jeu", "a..b.txt", r"..jeu\x"):
+        assert not unsafe_entry(name), name
+
+
+def test_extraction_dir_uses_a_subfolder_unless_everything_is_in_one_folder(tmp_path):
+    first = str(tmp_path / "Jeu.part01.rar")
+    assert extraction_dir(first, ["Jeu", r"Jeu\setup.exe", r"Jeu\data\a.bin"]) == str(tmp_path)
+    assert extraction_dir(first, ["setup.exe", "fg-01.bin"]) == str(tmp_path / "Jeu")
+    assert extraction_dir(first, [r"Jeu\setup.exe", r"Autre\x"]) == str(tmp_path / "Jeu")
+    assert extraction_dir(str(tmp_path / "Bonus.rar"), ["readme.txt"]) == str(tmp_path / "Bonus")
+
+
+def test_old_winrar_is_refused(monkeypatch):
+    monkeypatch.setattr(postprocess, "file_version", lambda path: (6, 24))
+    assert "CVE-2025-8088" in postprocess.winrar_problem("WinRAR.exe")
+    with pytest.raises(ExtractionBlocked, match="7.13"):
+        prepare_extraction("WinRAR.exe", "Jeu.rar")
+    monkeypatch.setattr(postprocess, "file_version", lambda path: (7, 13))
+    assert postprocess.winrar_problem("WinRAR.exe") is None
+
+
+def make_rar(tmp_path, volume_size="200k"):
+    src = tmp_path / "src" / "Jeu"
+    src.mkdir(parents=True)
+    (src / "setup.exe").write_bytes(os.urandom(600_000))
+    dest = tmp_path / "dl"
+    dest.mkdir()
+    subprocess.run([RAR, "a", "-ep1", "-m0", f"-v{volume_size}", "-idq", str(dest / "Jeu.rar"), str(src)], check=True)
+    return dest
+
+
+@pytest.mark.skipif(not (find_winrar() and os.path.exists(RAR)), reason="WinRAR absent")
+def test_prepare_extraction_checks_every_volume(tmp_path):
+    dest = make_rar(tmp_path)
+    first = str(dest / "Jeu.part1.rar")
+    assert prepare_extraction(find_winrar(), first) == str(dest)  # tout est dans le dossier « Jeu »
+    (dest / "Jeu.part3.rar").unlink()
+    with pytest.raises(ExtractionBlocked):
+        prepare_extraction(find_winrar(), first)

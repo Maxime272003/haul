@@ -14,6 +14,7 @@ FROZEN = getattr(sys, "frozen", False)
 DATA_DIR = Path(os.environ.get("APPDATA") or Path.home() / ".config") / "Haul"
 CONFIG_PATH = DATA_DIR / "config.json"
 LOG_PATH = DATA_DIR / "haul.log"
+QUEUE_PATH = DATA_DIR / "queue.json"
 REPORTS_DIR = DATA_DIR / "reports"
 
 ASSETS_DIR = (Path(sys._MEIPASS) / "haul" / "assets") if FROZEN else Path(__file__).parent / "assets"

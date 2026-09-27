@@ -33,6 +33,14 @@ def name_from_url(url):
     return None
 
 
+def is_page_url(url):
+    """Vraie page FuckingFast, seule chose que l'application accepte d'ouvrir dans le navigateur.
+
+    Tout le reste (chemin local, partage réseau, autre protocole…) serait lancé par Windows.
+    """
+    return isinstance(url, str) and LINK_RE.fullmatch(url) is not None
+
+
 def page_key(url):
     """Identifiant d'une page FuckingFast, sans le #nom, le www ni le préfixe /f/."""
     parts = urllib.parse.urlsplit(url)

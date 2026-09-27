@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Haul — FuckingFast
 // @namespace    haul.local
-// @version      3.0
+// @version      3.1
 // @description  Envoie le lien de téléchargement FuckingFast à l'app Haul, qui télécharge hors du navigateur.
 // @match        https://fuckingfast.co/*
 // @match        https://www.fuckingfast.co/*
 // @grant        GM_xmlhttpRequest
 // @grant        window.close
 // @connect      127.0.0.1
+// @downloadURL  http://127.0.0.1:17655/haul.user.js
+// @updateURL    http://127.0.0.1:17655/haul.user.js
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -16,6 +18,11 @@
   "use strict";
 
   const APP = "http://127.0.0.1:17655";
+  // Secret propre à ton installation de Haul, inséré quand l'app sert ce script : sans lui, Haul
+  // refuse la requête. Réinstalle le script depuis l'app (bouton « Installer le script navigateur »)
+  // si Haul affiche « script navigateur à mettre à jour ».
+  const TOKEN = "__HAUL_TOKEN__";
+  const OUTDATED = "Script Haul à mettre à jour : clique « Installer le script navigateur » dans l'app";
   const DIRECT_RE = /^https?:\/\/(?:dl\.fuckingfast\.co\/|(?:www\.)?fuckingfast\.co\/dl\/)/i;
   const LEGACY_RE = /window\.open\("(https?:\/\/(?:www\.)?fuckingfast\.co\/dl\/[^"]+)"\)/;
 
@@ -40,7 +47,7 @@
     GM_xmlhttpRequest({
       method: "POST",
       url: APP + path,
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Haul-Token": TOKEN },
       data: JSON.stringify(body),
       timeout: 5000,
       onload(r) {
@@ -63,7 +70,8 @@
       if (res.close) setTimeout(() => window.close(), 800);
     }, (code) => {
       state = "idle";
-      banner(code ? "Haul a refusé le lien (" + code + ")" : "Haul n'est pas lancé : téléchargement dans le navigateur",
+      banner(code === 401 ? OUTDATED
+        : code ? "Haul a refusé le lien (" + code + ")" : "Haul n'est pas lancé : téléchargement dans le navigateur",
         "#8a6d00");
       if (fallback) fallback();
     });
@@ -103,5 +111,5 @@
       clearInterval(timer);
       btn.click();
     }, 700);
-  }, () => banner("Haul n'est pas lancé", "#8a6d00"));
+  }, (code) => banner(code === 401 ? OUTDATED : "Haul n'est pas lancé", "#8a6d00"));
 })();

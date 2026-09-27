@@ -1,21 +1,22 @@
+import json
 import struct
 import zlib
 
-from haul.engine import Job
-from haul.gui import App, plural, status_kind
+from haul.engine import Job, State
+from haul.gui import App, dump_jobs, load_jobs, plural, status_kind
 from haul.theme import arc, circle, png, rounded_rect
 
 
-def test_status_kind_covers_engine_and_postprocess_statuses():
-    assert status_kind("En attente") == "wait"
-    assert status_kind("En attente de téléchargement") == "wait"
-    assert status_kind("Dans le navigateur : valide le captcha si demandé") == "browser"
-    assert status_kind("Connexion au serveur…") == "busy"
-    assert status_kind("Téléchargement (8 connexions)") == "download"
-    assert status_kind("Terminé") == status_kind("Déjà présent") == status_kind("Extrait ✔") == "done"
-    assert status_kind("Extraction…") == "busy"
-    for failed in ("Erreur : aucun lien reçu", "Échec extraction (code 3)", "Extraction bloquée"):
+def test_status_kind_covers_every_state():
+    assert status_kind(State.WAITING) == status_kind(State.QUEUED) == "wait"
+    assert status_kind(State.BROWSER) == "browser"
+    assert status_kind(State.PAUSED) == "paused"
+    assert status_kind(State.CONNECTING) == status_kind(State.CHECKING) == status_kind(State.EXTRACTING) == "busy"
+    assert status_kind(State.DOWNLOADING) == "download"
+    assert status_kind(State.DONE) == status_kind(State.PRESENT) == status_kind(State.EXTRACTED) == "done"
+    for failed in (State.ERROR, State.EXTRACT_FAILED, State.BLOCKED):
         assert status_kind(failed) == "error"
+    assert all(status_kind(s) for s in State)
 
 
 def test_plural():
@@ -25,13 +26,43 @@ def test_plural():
 
 
 def test_row_progress_and_speed():
-    job = Job(id=1, url="u", dest=".", name="a.rar", status="Téléchargement (8 connexions)",
+    job = Job(id=1, url="u", dest=".", name="a.rar", state=State.DOWNLOADING, detail="Téléchargement (8 connexions)",
               done=312 << 20, total=500 << 20, speed=5 << 20)
     assert App._row(job) == ("Téléchargement (8 connexions)", "62 %  ·  312.0 / 500.0 Mo", "5.0 Mo/s", "")
     job.total = 3 << 30  # unités différentes : les deux sont affichées
     assert App._row(job)[1] == "10 %  ·  312.0 Mo / 3.0 Go"
-    job.status, job.done, job.total = "Terminé", 500 << 20, 500 << 20
-    assert App._row(job)[1:3] == ("500.0 Mo", "")  # plus de vitesse une fois terminé
+    job.state, job.detail, job.done, job.total = State.DONE, "", 500 << 20, 500 << 20
+    assert App._row(job)[:3] == ("Terminé", "500.0 Mo", "")  # plus de vitesse une fois terminé
+
+
+def test_saved_queue_round_trip_pauses_unfinished_jobs():
+    jobs = [
+        Job(1, "https://fuckingfast.co/a#A.rar", "D:/dl", name="A.rar", state=State.EXTRACTED, done=5, total=5,
+            vt="RAS", processed=True),
+        Job(2, "https://fuckingfast.co/b#B.rar", "D:/dl", name="B.rar", state=State.DOWNLOADING,
+            detail="Téléchargement (8 connexions)", done=3, total=9),
+        Job(3, "https://fuckingfast.co/c", "D:/dl", state=State.BROWSER),
+        Job(4, "https://fuckingfast.co/d#D.rar", "D:/dl", name="D.rar", state=State.EXTRACTING, processed=True),
+        Job(5, "https://fuckingfast.co/e", "D:/dl", state=State.ERROR, detail="Erreur : HTTP 404"),
+    ]
+    restored = load_jobs(json.loads(json.dumps(dump_jobs(jobs))), first_id=10)
+    assert [j.id for j in restored] == [10, 11, 12, 13, 14]
+    assert [(j.state, j.status) for j in restored] == [
+        (State.EXTRACTED, "Extrait ✔"), (State.PAUSED, "En pause"), (State.PAUSED, "En pause"),
+        (State.DONE, "Terminé"), (State.ERROR, "Erreur : HTTP 404")]
+    assert (restored[0].vt, restored[0].processed) == ("RAS", True)
+    assert (restored[1].name, restored[1].done, restored[1].total) == ("B.rar", 3, 9)
+    assert restored[3].processed is False  # extraction interrompue : à refaire
+
+
+def test_saved_queue_ignores_damaged_entries():
+    items = [{"url": "u"}, {"url": 1, "dest": "d", "state": "done"}, "x",
+             {"url": "https://fuckingfast.co/a", "dest": "d", "state": "inconnu"},
+             {"url": "https://fuckingfast.co/a", "dest": "d", "state": "done", "name": "../../x.exe", "total": "9"}]
+    restored = load_jobs(items)
+    assert len(restored) == 1
+    assert restored[0].name == "_.._x.exe" and restored[0].total is None
+    assert load_jobs({"pas": "une liste"}) == []
 
 
 def _decode(data):

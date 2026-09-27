@@ -20,7 +20,7 @@ from rich.progress import (
 )
 
 from . import __version__
-from .config import ResultCache, config_path, load_config, resolve_api_key, save_config
+from .config import ResultCache, config_path, load_config, resolve_api_key, store_api_key
 from .hashing import human_size
 from .rarscan import group_volume_sets
 from .render import make_console, render_no_key, render_results
@@ -442,20 +442,20 @@ def cmd_config(args) -> int:
         if len(key) < 32:
             console.print("[red]Clé invalide (une clé VirusTotal fait 64 caractères).[/red]")
             return 1
-        data = load_config()
-        data["api_key"] = key
-        path = save_config(data)
+        path = store_api_key(key)
         console.print(f"[green]Clé enregistrée dans[/green] {path}")
         return 0
 
+    key = resolve_api_key()  # chiffre au passage une ancienne cle en clair
     data = load_config()
-    key = resolve_api_key()
     source = "non configurée"
     if key:
         import os
 
         if os.environ.get("VT_API_KEY") or os.environ.get("VIRUSTOTAL_API_KEY"):
             source = "variable d'environnement"
+        elif data.get("api_key_dpapi"):
+            source = f"{config_path()}, chiffrée (DPAPI)"
         elif data.get("api_key"):
             source = str(config_path())
     console.print(f"Clé API   : {'*' * 8 + key[-4:] if key else '-'}  ({source})")

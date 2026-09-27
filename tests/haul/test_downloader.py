@@ -1,7 +1,9 @@
 import threading
+import time
 
 import pytest
 
+from haul import downloader
 from haul.downloader import Cancelled, Downloader, Refused
 
 from .conftest import DATA
@@ -70,3 +72,22 @@ def test_html_answer_is_refused(file_server):
     srv = file_server(html=True)
     with pytest.raises(Refused):
         Downloader(srv.url, "x", NO_AUTH).probe()
+
+
+def test_unexpected_range_is_not_written(file_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(downloader, "MAX_RETRIES", 1)
+    srv = file_server(wrong_range=True)
+    out = tmp_path / "f.bin"
+    with pytest.raises(OSError, match="plage inattendue"):
+        fetch(srv.url, out, connections=2)
+    assert not out.exists()
+
+
+def test_speed_limit_slows_download(file_server, tmp_path):
+    srv = file_server()
+    d = Downloader(srv.url, "x", NO_AUTH, 2, speed_limit=lambda: 2 << 20)  # 2 × 2 Mo/s
+    d.probe()
+    start = time.monotonic()
+    d.download(str(tmp_path / "f.bin"), lambda done, total: None)
+    assert time.monotonic() - start > 2  # 12 Mo à 4 Mo/s ; sans limite, moins d'une seconde
+    assert (tmp_path / "f.bin").read_bytes() == DATA

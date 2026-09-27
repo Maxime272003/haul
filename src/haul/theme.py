@@ -200,6 +200,11 @@ class Theme:
             key, layers = "error", [(circle(cx, cy, r + w / 2), c["red"]),
                                     (union(segment(cx, 4.6 * k, cx, 8.6 * k, 1.9 * k),
                                            circle(cx, 11.2 * k, 1.05 * k)), "#FFFFFF")]
+        elif kind == "paused":
+            k = s / 16
+            key, layers = "paused", [(arc(cx, cy, r, w), c["ring"]),
+                                     (union(segment(6.4 * k, 5.6 * k, 6.4 * k, 10.4 * k, 1.9 * k),
+                                            segment(9.6 * k, 5.6 * k, 9.6 * k, 10.4 * k, 1.9 * k)), c["muted"])]
         elif kind == "browser":
             key, layers = "browser", [(arc(cx, cy, r, w), c["amber"]), (circle(cx, cy, r / 2.4), c["amber"])]
         else:  # en attente

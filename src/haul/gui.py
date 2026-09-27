@@ -1,44 +1,88 @@
 """Fenêtre principale (Tkinter)."""
 
+import json
 import logging
 import os
 import queue
 import subprocess
 import threading
+import time
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, clipboard, config, postprocess
-from .engine import DOWNLOADED, Engine, Job
-from .links import FILE_HINT_RE, LINK_RE, human_size, name_from_url, page_key
-from .paths import ICON_PATH
+from . import __version__, clipboard, config, notify, postprocess
+from .engine import ACTIVE, ON_DISK, Engine, Job, State
+from .links import FILE_HINT_RE, LINK_RE, human_size, is_page_url, name_from_url, page_key, safe_name
+from .paths import ICON_PATH, QUEUE_PATH
 from .server import PORT, USERSCRIPT_URL, LinkServer
 from .theme import Theme
-from .widgets import CellTooltip, Flow, Stepper
+from .widgets import CellTooltip, ChoiceStepper, Flow, Stepper
 
 log = logging.getLogger(__name__)
 
 HINT = "Sélectionne les liens fuckingfast.co sur la page web et fais Ctrl+C."
 STATUS_DOTS = {"info": "faint", "ok": "green", "warn": "amber", "error": "red"}
+SPEED_CHOICES = (0, 1, 2, 5, 10, 20, 50, 100)  # débit total maximal, Mo/s (0 = illimité)
+CAPTCHA_ALERT_AFTER = 10  # secondes dans le navigateur sans lien reçu : on prévient
+NOTIFICATION_LIFETIME = 30_000  # ms avant de retirer l'icône de notification
+VT_KEY_URL = "https://www.virustotal.com/gui/my-apikey"
+EICAR_SHA256 = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"  # connu de VirusTotal
+
+KINDS = {
+    State.WAITING: "wait", State.QUEUED: "wait", State.BROWSER: "browser", State.PAUSED: "paused",
+    State.CONNECTING: "busy", State.CHECKING: "busy", State.EXTRACTING: "busy", State.DOWNLOADING: "download",
+    State.DONE: "done", State.PRESENT: "done", State.EXTRACTED: "done",
+    State.ERROR: "error", State.EXTRACT_FAILED: "error", State.BLOCKED: "error",
+}
+# Repris tels quels au lancement suivant ; les autres (en cours à la fermeture) passent en pause.
+RESTORED = frozenset({State.DONE, State.PRESENT, State.EXTRACTED, State.EXTRACT_FAILED, State.BLOCKED,
+                      State.ERROR, State.PAUSED})
 
 
-def status_kind(status):
-    """Famille d'un statut de fichier : wait, browser, busy, download, done ou error."""
-    if status.startswith(("Erreur", "Échec", "Extraction bloquée")):
-        return "error"
-    if status in DOWNLOADED or status.startswith("Extrait"):
-        return "done"
-    if status.startswith("Téléchargement"):
-        return "download"
-    if status.startswith("Dans le navigateur"):
-        return "browser"
-    if status.startswith(("Extraction", "Connexion")):
-        return "busy"
-    return "wait"
+def status_kind(state):
+    """Famille d'un état : wait, browser, paused, busy, download, done ou error."""
+    return KINDS[state]
 
 
 def plural(n, word, plural_word=None):
     return f"{n} {word if n < 2 else plural_word or word + 's'}"
+
+
+def speed_label(mb):
+    return f"{mb} Mo/s" if mb else "illimité"
+
+
+# --- sauvegarde de la liste entre deux lancements ---
+
+def dump_jobs(jobs):
+    return [{"url": j.url, "dest": j.dest, "name": j.name, "state": j.state.value, "detail": j.detail,
+             "done": j.done, "total": j.total, "vt": j.vt, "processed": j.processed} for j in jobs]
+
+
+def load_jobs(items, first_id=1):
+    """Jobs sauvegardés par dump_jobs ; ce qui était en cours revient en pause."""
+    jobs = []
+    for item in items if isinstance(items, list) else []:
+        try:
+            state, url, dest = State(item["state"]), item["url"], item["dest"]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not isinstance(url, str) or not isinstance(dest, str):
+            continue
+        detail = item.get("detail") if isinstance(item.get("detail"), str) else ""
+        processed = bool(item.get("processed"))
+        if state in (State.CHECKING, State.EXTRACTING):  # traitement interrompu : à refaire
+            state, detail, processed = State.DONE, "", False
+        elif state not in RESTORED:
+            state, detail = State.PAUSED, ""
+        name = item.get("name")
+        total = item.get("total")
+        done = item.get("done")
+        jobs.append(Job(id=first_id + len(jobs), url=url, dest=dest,
+                        name=safe_name(name) if isinstance(name, str) else None, state=state, detail=detail,
+                        done=done if isinstance(done, int) else 0, total=total if isinstance(total, int) else None,
+                        vt=item.get("vt") if isinstance(item.get("vt"), str) else "", processed=processed))
+    return jobs
 
 
 class App:
@@ -47,16 +91,23 @@ class App:
         self.cfg = config.load()
         self.events = queue.Queue()    # (job.id, {champ: valeur}) ou (None, {"message": …, "done": bool, "kind": …})
         self.incoming = queue.Queue()  # liens reçus pour des pages ouvertes à la main dans le navigateur
+        self.calls = queue.Queue()     # fonctions à exécuter dans le thread de l'interface
         self.engine = Engine(self.events, lambda *link: self.incoming.put(link))
         self.engine.set_parallel(self.cfg["parallel"])
         self.engine.set_connections(self.cfg["connections"])
+        self.engine.set_max_speed(self.cfg["max_speed"] << 20)
         self.jobs = {}
         self.seen = set()
         self.next_id = 1
         self.busy = False       # analyse / extraction en cours
-        self.processed = set()  # fichiers déjà passés par l'analyse + extraction automatiques
         self.last_report = None
         self.tick = 0           # animation des icônes « en cours »
+        self.queue_dirty = False
+        self.last_queue_save = 0.0
+        self.browser_since = {}  # job.id -> début de l'attente dans le navigateur
+        self.captcha_alerted = set()
+        self.was_active = False
+        self.notification_timer = None
 
         self.theme = Theme(root, self.cfg["theme"])
         px = self.theme.px
@@ -69,12 +120,17 @@ class App:
         width = max(root.winfo_reqwidth(), min(px(1240), root.winfo_screenwidth() * 92 // 100))
         root.geometry(f"{width}x{min(px(760), root.winfo_screenheight() * 85 // 100)}")
         self.theme.decorate(root)
+        self.hwnd = notify.window_handle(root)
+        self.taskbar = notify.TaskbarProgress(self.hwnd)
+        self.notifier = notify.Notifier(self.hwnd, ICON_PATH if ICON_PATH.exists() else None)
+        self._restore_queue()
         self.last_seq = clipboard.sequence()
-        root.after(700, self._poll_clipboard)
-        root.after(200, self._drain_events)
+        self.timers = {"clipboard": root.after(700, self._poll_clipboard),
+                       "events": root.after(200, self._drain_events)}
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         try:
-            self.server = LinkServer(self.engine)
+            self.server = LinkServer(self.engine, self.cfg["token"],
+                                     on_bad_token=lambda: self.calls.put(self._script_outdated))
             threading.Thread(target=self.server.serve_forever, daemon=True).start()
         except OSError:
             self.server = None
@@ -83,9 +139,11 @@ class App:
     # --- configuration ---
 
     def _save_config(self):
+        speed = SPEED_CHOICES[self.speed_stepper.index()]
         self.cfg.update(folder=self.folder_var.get(), parallel=self._spin_value(self.parallel_var, 1, 6),
-                        connections=self._spin_value(self.conn_var, 1, 16), watch=self.watch_var.get(),
-                        scan=self.scan_var.get(), extract=self.extract_var.get())
+                        connections=self._spin_value(self.conn_var, 1, 16), max_speed=speed,
+                        watch=self.watch_var.get(), scan=self.scan_var.get(), extract=self.extract_var.get(),
+                        notify=self.notify_var.get())
         config.save(self.cfg)
 
     @staticmethod
@@ -99,6 +157,11 @@ class App:
         self._save_config()
         self.engine.set_parallel(self.cfg["parallel"])
         self.engine.set_connections(self.cfg["connections"])
+        self.engine.set_max_speed(self.cfg["max_speed"] << 20)
+
+    def _switch_changed(self):
+        self._save_config()
+        self._postprocess()  # analyse / extraction activée alors que la liste est déjà finie
 
     # --- interface ---
 
@@ -162,24 +225,35 @@ class App:
         self.watch_var = tk.BooleanVar(value=self.cfg["watch"])
         self.parallel_var = tk.StringVar(value=str(self.cfg["parallel"]))
         self.conn_var = tk.StringVar(value=str(self.cfg["connections"]))
+        speed = min(SPEED_CHOICES, key=lambda v: abs(v - self.cfg["max_speed"]))
+        self.speed_var = tk.StringVar(value=speed_label(speed))
         self.scan_var = tk.BooleanVar(value=self.cfg["scan"])
         self.extract_var = tk.BooleanVar(value=self.cfg["extract"])
+        self.notify_var = tk.BooleanVar(value=self.cfg["notify"])
 
         def switch(text, var):
             return ttk.Checkbutton(opts, text=text, variable=var, style="Switch.TCheckbutton",
-                                   command=self._save_config)
+                                   command=self._switch_changed)
 
-        def stepper(text, var, hi):
+        def labelled(text, make):
             box = ttk.Frame(opts, style="Surface.TFrame")
             ttk.Label(box, text=text, style="Surface.TLabel").pack(side="left", padx=(0, px(10)))
-            Stepper(box, var, 1, hi, command=self._settings_changed, style="Surface.TFrame").pack(side="left")
-            return box
+            widget = make(box)
+            widget.pack(side="left")
+            return box, widget
 
-        opts.add(switch("Surveiller le presse-papier", self.watch_var),
-                 stepper("Fichiers simultanés", self.parallel_var, 6),
-                 stepper("Connexions par fichier", self.conn_var, 16),
+        parallel, _ = labelled("Fichiers simultanés", lambda box: Stepper(
+            box, self.parallel_var, 1, 6, command=self._settings_changed, style="Surface.TFrame"))
+        conns, _ = labelled("Connexions par fichier", lambda box: Stepper(
+            box, self.conn_var, 1, 16, command=self._settings_changed, style="Surface.TFrame"))
+        speed_box, self.speed_stepper = labelled("Débit max", lambda box: ChoiceStepper(
+            box, self.speed_var, [speed_label(v) for v in SPEED_CHOICES], command=self._settings_changed,
+            style="Surface.TFrame"))
+        opts.add(switch("Surveiller le presse-papier", self.watch_var), parallel, conns, speed_box,
                  switch("Analyser avec VirusTotal", self.scan_var),
-                 switch("Puis extraire avec WinRAR", self.extract_var))
+                 ttk.Button(opts, text="Clé VirusTotal…", command=self._api_key_dialog),
+                 switch("Puis extraire avec WinRAR", self.extract_var),
+                 switch("Notifications", self.notify_var))
         return card
 
     def _build_list_header(self, parent):
@@ -228,6 +302,7 @@ class App:
         self.tree.bind("<Button-3>", self._context_menu)
         self.tree.bind("<Double-1>", lambda e: self._reveal(self._job_at(e.y)))
         self.tree.bind("<Delete>", lambda e: self._remove(self._selected_jobs()))
+        self.tree.bind("<space>", lambda e: self._toggle_pause(self._selected_jobs()))
 
         self.empty = ttk.Frame(card, style="Surface.TFrame")
         ttk.Label(self.empty, text="Aucun téléchargement", style="EmptyTitle.TLabel").pack()
@@ -238,6 +313,8 @@ class App:
 
     def _text_width(self, text):
         if text not in self._text_widths:
+            if len(self._text_widths) > 4000:  # textes de progression : tous différents
+                self._text_widths.clear()
             self._text_widths[text] = self.theme.font.measure(text)
         return self._text_widths[text]
 
@@ -283,19 +360,20 @@ class App:
         jobs = self._selected_jobs()
         if len(jobs) == 1 and not self.busy:
             job = jobs[0]
-            kind = {"error": "error", "done": "ok"}.get(status_kind(job.status), "info")
+            kind = {"error": "error", "done": "ok"}.get(status_kind(job.state), "info")
             vt = f" · VirusTotal : {job.vt}" if job.vt else ""
             self._status(f"{job.name or job.url} — {job.status}{vt}", kind)
 
     def _build_actions(self, parent):
         px = self.theme.px
         actions = Flow(parent, gap=px(8), row_gap=px(8))
+        self.resume_btn = ttk.Button(actions, text="Tout reprendre", command=self._resume_all)
         self.retry_btn = ttk.Button(actions, text="Réessayer les échecs", command=self._retry_failed)
         self.clear_btn = ttk.Button(actions, text="Retirer les terminés", command=self._clear_done)
         self.process_btn = ttk.Button(actions, text="Analyser / extraire maintenant",
                                       command=lambda: self._postprocess(manual=True))
         self.report_btn = ttk.Button(actions, text="Rapport VirusTotal", command=self._show_report)
-        actions.add(self.retry_btn, self.clear_btn, self.process_btn, self.report_btn)
+        actions.add(self.resume_btn, self.retry_btn, self.clear_btn, self.process_btn, self.report_btn)
         return actions
 
     def _build_statusbar(self):
@@ -340,6 +418,54 @@ class App:
         os.makedirs(folder, exist_ok=True)
         os.startfile(folder)
 
+    def _script_outdated(self):
+        self._status("Le script navigateur est à mettre à jour : clique « Installer le script navigateur » "
+                     "puis confirme dans Violentmonkey / Tampermonkey.", "warn")
+
+    # --- notifications ---
+
+    def _alert(self, title, text, warning=False):
+        """Prévient hors de la fenêtre (notification + bouton qui clignote) si elle n'est pas au premier plan."""
+        if not self.notify_var.get() or notify.is_foreground(self.hwnd):
+            return
+        notify.flash(self.hwnd)
+        self.notifier.show(title, text, warning)
+        if self.notification_timer:
+            self.root.after_cancel(self.notification_timer)
+        self.notification_timer = self.root.after(NOTIFICATION_LIFETIME, self.notifier.remove)
+
+    def _watch_attention(self, kinds):
+        """Captcha qui attend, fin de la liste : notification et progression dans la barre des tâches."""
+        now = time.monotonic()
+        waiting = [self.jobs[i] for i, since in self.browser_since.items()
+                   if now - since > CAPTCHA_ALERT_AFTER and i in self.jobs]
+        for job in waiting:
+            if job.id not in self.captcha_alerted:
+                self.captcha_alerted.add(job.id)
+                self._alert("Captcha à valider", f"{job.name or job.url} attend dans ton navigateur.", warning=True)
+
+        active = any(j.state in ACTIVE for j in self.jobs.values())
+        if self.was_active and not active:
+            done, errors = kinds.get("done", 0), kinds.get("error", 0)
+            self._alert("Téléchargements terminés",
+                        plural(done, "fichier terminé", "fichiers terminés")
+                        + (f", {plural(errors, 'erreur')}" if errors else ""), warning=bool(errors))
+        self.was_active = active
+
+        tb = notify.TaskbarProgress
+        if active:
+            sized = [j for j in self.jobs.values() if j.total and (j.state in ACTIVE or j.state in ON_DISK)]
+            total = sum(j.total for j in sized)
+            fraction = sum(min(j.done, j.total) for j in sized) / total if total else None
+            state = tb.PAUSED if waiting else tb.NORMAL if fraction is not None else tb.INDETERMINATE
+            self.taskbar.set(state, fraction)
+        elif self.busy:
+            self.taskbar.set(tb.INDETERMINATE)
+        elif kinds.get("error"):
+            self.taskbar.set(tb.ERROR, 1.0)
+        else:
+            self.taskbar.set(tb.NONE)
+
     # --- menu contextuel ---
 
     def _job_at(self, y):
@@ -359,15 +485,22 @@ class App:
         job = self.jobs[int(iid)]
         m = self.menu
         m.delete(0, "end")
+
+        def item(label, command, targets):
+            m.add_command(label=label, command=lambda: command(targets), state="normal" if targets else "disabled")
+
         m.add_command(label="Afficher dans l'Explorateur", command=lambda: self._reveal(job))
         m.add_command(label="Copier le lien de la page", command=lambda: self._copy_links(jobs))
+        in_browser = [j for j in jobs if j.state == State.BROWSER and is_page_url(j.url)]
+        if in_browser:
+            item("Rouvrir la page dans le navigateur", self._reopen_pages, in_browser)
         m.add_separator()
-        failed = [j for j in jobs if j.status.startswith("Erreur")]
-        m.add_command(label="Réessayer", command=lambda: self._retry(failed),
-                      state="normal" if failed else "disabled")
-        removable = [j for j in jobs if status_kind(j.status) in ("done", "error")]
-        m.add_command(label="Retirer de la liste", command=lambda: self._remove(removable),
-                      state="normal" if removable else "disabled")
+        pausable = [j for j in jobs if j.state in ACTIVE]
+        item("Passer ce lien (pause)" if in_browser and len(jobs) == 1 else "Mettre en pause", self._pause, pausable)
+        item("Reprendre", self._resume, [j for j in jobs if j.state == State.PAUSED])
+        item("Réessayer", self._retry, [j for j in jobs if j.state == State.ERROR])
+        item("Retirer de la liste", self._remove, [j for j in jobs if status_kind(j.state) != "busy"
+                                                   or j.state == State.CONNECTING])
         m.tk_popup(event.x_root, event.y_root)
 
     def _reveal(self, job):
@@ -378,6 +511,11 @@ class App:
         else:
             self._open_folder(job.dest)
 
+    def _reopen_pages(self, jobs):
+        for job in jobs:
+            if is_page_url(job.url):
+                os.startfile(job.url)
+
     def _copy_links(self, jobs):
         self.root.clipboard_clear()
         self.root.clipboard_append("\n".join(j.url for j in jobs))
@@ -386,13 +524,36 @@ class App:
         self._status(f"{plural(len(jobs), 'lien copié', 'liens copiés')}.", "ok")
 
     def _remove(self, jobs):
+        """Retire de la liste ; un fichier en cours est d'abord mis en pause (le fichier partiel reste)."""
         for job in jobs:
-            if status_kind(job.status) not in ("done", "error"):
-                continue  # encore géré par le moteur
+            if job.state in (State.CHECKING, State.EXTRACTING) or job.id not in self.jobs:
+                continue  # analyse / extraction en cours
+            if job.state in ACTIVE:
+                self.engine.pause(job)
             self.tree.delete(str(job.id))
             del self.jobs[job.id]
             self.seen.discard(page_key(job.url))  # pourra être ajouté de nouveau
-            self.processed.discard(job.path)
+            self.browser_since.pop(job.id, None)
+            self.columns_dirty = self.queue_dirty = True
+
+    def _pause(self, jobs):
+        for job in jobs:
+            if job.state in ACTIVE:
+                self.engine.pause(job)
+
+    def _resume(self, jobs):
+        for job in jobs:
+            if job.state == State.PAUSED:
+                self.engine.submit(job)
+
+    def _toggle_pause(self, jobs):
+        if any(j.state in ACTIVE for j in jobs):
+            self._pause(jobs)
+        else:
+            self._resume(jobs)
+
+    def _resume_all(self):
+        self._resume(list(self.jobs.values()))
 
     # --- presse-papier ---
 
@@ -409,7 +570,7 @@ class App:
             self.last_seq = seq
             if self.watch_var.get():
                 self._add_from_clipboard(quiet=True)
-        self.root.after(700, self._poll_clipboard)
+        self.timers["clipboard"] = self.root.after(700, self._poll_clipboard)
 
     def _paste_shortcut(self, event):
         if not isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Text)):
@@ -435,19 +596,48 @@ class App:
             self._status("Ces liens sont déjà dans la liste.")
         return bool(urls)
 
+    def _insert(self, job):
+        self.seen.add(page_key(job.url))
+        self.jobs[job.id] = job
+        self.tree.insert("", "end", iid=str(job.id), **self._item(job))
+        self.columns_dirty = self.queue_dirty = True
+
     def _add_job(self, url, dl_url=None, user_agent=None):
-        key = page_key(url)
-        if key in self.seen:
+        if page_key(url) in self.seen:
             return False
-        self.seen.add(key)
         job = Job(id=self.next_id, url=url, dest=self.folder_var.get(), name=name_from_url(url),
                   dl_url=dl_url, user_agent=user_agent)
         self.next_id += 1
-        self.jobs[job.id] = job
-        self.tree.insert("", "end", iid=str(job.id), **self._item(job))
-        self.columns_dirty = True
+        self._insert(job)
         self.engine.submit(job)
         return True
+
+    # --- liste sauvegardée ---
+
+    def _restore_queue(self):
+        try:
+            items = json.loads(QUEUE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        jobs = load_jobs(items, self.next_id)
+        for job in jobs:
+            self._insert(job)
+        self.next_id += len(jobs)
+        self.queue_dirty = False
+        paused = sum(j.state == State.PAUSED for j in jobs)
+        if paused:
+            self._status(f"{plural(paused, 'téléchargement interrompu', 'téléchargements interrompus')} "
+                         "lors de la dernière session : « Tout reprendre » pour continuer.", "warn")
+
+    def _save_queue(self):
+        self.queue_dirty, self.last_queue_save = False, time.monotonic()
+        try:
+            QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = QUEUE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(dump_jobs(self.jobs.values()), ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(QUEUE_PATH)
+        except OSError:
+            log.exception("Sauvegarde de la liste impossible")
 
     # --- suivi des téléchargements ---
 
@@ -464,49 +654,71 @@ class App:
             progress = human_size(job.done)
         else:
             progress = ""
-        speed = f"{human_size(job.speed)}/s" if job.speed > 0 and job.status.startswith("Téléchargement") else ""
+        speed = f"{human_size(job.speed)}/s" if job.speed > 0 and job.state == State.DOWNLOADING else ""
         return (job.status, progress, speed, job.vt)
 
     def _item(self, job):
-        kind = status_kind(job.status)
-        fraction = job.done / job.total if kind == "download" and job.total else None
+        kind = status_kind(job.state)
+        fraction = job.done / job.total if kind in ("download", "paused") and job.total else None
         image = self.theme.status_icon(kind, fraction, self.tick)
         return {"text": job.name or job.url, "image": image, "values": self._row(job)}
 
     def _drain_events(self):
+        try:
+            self._apply_events()
+        except Exception:
+            log.exception("Mise à jour de l'interface")
+        finally:
+            self.timers["events"] = self.root.after(200, self._drain_events)
+
+    def _apply_events(self):
+        while not self.calls.empty():
+            self.calls.get()()
         while not self.incoming.empty():
             page_url, dl_url, user_agent = self.incoming.get()
             if self._add_job(page_url or dl_url, dl_url, user_agent):
                 self._status("Lien reçu du navigateur.", "ok")
+        changed = False
         try:
             while True:
                 job_id, fields = self.events.get_nowait()
                 if job_id is None:  # message de l'analyse / extraction
                     self.busy = not fields.get("done")
-                    self._status(fields["message"], fields.get("kind") or ("busy" if self.busy else "ok"))
+                    kind = fields.get("kind") or ("busy" if self.busy else "ok")
+                    self._status(fields["message"], kind)
+                    if fields.get("done"):
+                        changed = True
+                        self._alert("Analyse / extraction terminée", fields["message"], warning=kind == "error")
                     continue
                 job = self.jobs.get(job_id)
                 if not job:
                     continue
                 for k, v in fields.items():
                     setattr(job, k, v)
-                if "name" in fields or "status" in fields:
-                    self.columns_dirty = True
+                if fields.keys() & {"state", "name", "vt", "detail"}:
+                    self.columns_dirty = self.queue_dirty = changed = True
+                if "state" in fields:
+                    if job.state == State.BROWSER:
+                        self.browser_since.setdefault(job.id, time.monotonic())
+                    else:
+                        self.browser_since.pop(job.id, None)
                 if self.tree.exists(str(job_id)):
                     self.tree.item(str(job_id), **self._item(job))
         except queue.Empty:
             pass
-        self._refresh()
-        if self.scan_var.get() or self.extract_var.get():
+        kinds = self._refresh()
+        self._watch_attention(kinds)
+        if self.queue_dirty and time.monotonic() - self.last_queue_save > 2:
+            self._save_queue()
+        if changed and (self.scan_var.get() or self.extract_var.get()):
             self._postprocess()
-        self.root.after(200, self._drain_events)
 
     def _refresh(self):
-        """Animations, compteurs, débit total et boutons disponibles."""
+        """Animations, compteurs, débit total et boutons disponibles. Retourne le nombre de fichiers par famille."""
         self.tick += 1
         kinds = {}
         for job in self.jobs.values():
-            kind = status_kind(job.status)
+            kind = status_kind(job.state)
             kinds[kind] = kinds.get(kind, 0) + 1
             if kind == "busy" or (kind == "download" and not job.total):
                 self.tree.item(str(job.id), image=self.theme.status_icon(kind, frame=self.tick))
@@ -520,6 +732,7 @@ class App:
             parts = [plural(len(self.jobs), "fichier")]
             active = kinds.get("download", 0) + kinds.get("busy", 0) + kinds.get("browser", 0)
             for n, text in ((active, "en cours"), (kinds.get("wait", 0), "en attente"),
+                            (kinds.get("paused", 0), "en pause"),
                             (kinds.get("done", 0), plural(kinds.get("done", 0), "terminé")[2:]),
                             (kinds.get("error", 0), plural(kinds.get("error", 0), "erreur")[2:])):
                 if n:
@@ -529,38 +742,30 @@ class App:
             self.empty.place(relx=0.5, rely=0.5, anchor="center")
             self.summary_var.set("")
 
-        total = sum(j.speed for j in self.jobs.values() if j.status.startswith("Téléchargement"))
+        total = sum(j.speed for j in self.jobs.values() if j.state == State.DOWNLOADING)
         self.total_var.set(f"↓ {human_size(total)}/s  ·  {total * 8 / 1e6:.0f} Mbit/s" if total else "")
 
         def enable(button, on):
             button.state(["!disabled"] if on else ["disabled"])
-        enable(self.retry_btn, kinds.get("error", 0) and any(j.status.startswith("Erreur")
-                                                               for j in self.jobs.values()))
+        enable(self.resume_btn, kinds.get("paused", 0))
+        enable(self.retry_btn, any(j.state == State.ERROR for j in self.jobs.values()))
         enable(self.clear_btn, kinds.get("done", 0))
-        enable(self.process_btn, not self.busy and any(self._downloaded(j) for j in self.jobs.values()))
+        enable(self.process_btn, not self.busy and any(j.state in ON_DISK for j in self.jobs.values()))
         enable(self.report_btn, self.last_report is not None)
+        return kinds
 
     def _retry(self, jobs):
         for job in jobs:
-            if job.status.startswith("Erreur"):
-                job.status, job.speed = "En attente", 0
-                self.tree.item(str(job.id), **self._item(job))
+            if job.state == State.ERROR:
                 self.engine.submit(job)
 
     def _retry_failed(self):
         self._retry(list(self.jobs.values()))
 
     def _clear_done(self):
-        for job in list(self.jobs.values()):
-            if job.status in DOWNLOADED or job.status.startswith("Extrait"):
-                self.tree.delete(str(job.id))
-                del self.jobs[job.id]
+        self._remove([j for j in self.jobs.values() if status_kind(j.state) == "done"])
 
     # --- analyse VirusTotal puis extraction ---
-
-    @staticmethod
-    def _downloaded(job):
-        return job.status in DOWNLOADED or job.status.startswith(("Extr", "Échec extraction"))
 
     def _postprocess(self, manual=False):
         """Analyse puis extrait les fichiers téléchargés.
@@ -569,10 +774,10 @@ class App:
         """
         if self.busy or not self.jobs:
             return
-        if not manual and not all(self._downloaded(j) for j in self.jobs.values()):
-            return  # téléchargements en cours, en attente ou en échec
-        batch = [j for j in self.jobs.values() if self._downloaded(j) and j.path
-                 and (not j.status.startswith("Extrait") if manual else j.path not in self.processed)]
+        if not manual and not all(j.state in ON_DISK for j in self.jobs.values()):
+            return  # téléchargements en cours, en attente, en pause ou en échec
+        batch = [j for j in self.jobs.values() if j.state in ON_DISK and j.path
+                 and (j.state != State.EXTRACTED if manual else not j.processed)]
         if not batch:
             if manual:
                 self._status("Rien à traiter : aucun fichier téléchargé en attente.")
@@ -584,13 +789,18 @@ class App:
             self.extract_var.set(False)
         if not scan and not winrar:
             return
-        self.processed.update(j.path for j in batch)
+        for job in batch:
+            job.processed = True
+        self.queue_dirty = True
         self.busy = True
         threading.Thread(target=self._postprocess_worker, args=(batch, scan, winrar), daemon=True).start()
 
     def _postprocess_worker(self, batch, scan, winrar):
         def put(job, **fields):
             self.events.put((job.id, fields))
+
+        def set_state(job, state, detail=""):
+            put(job, state=state, detail=detail)
 
         def status(message, done=False, kind=None):
             self.events.put((None, {"message": message, "done": done, "kind": kind}))
@@ -604,7 +814,9 @@ class App:
             except Exception as e:
                 log.exception("Analyse VirusTotal impossible")
                 for job in batch:
-                    put(job, vt="non analysé")
+                    put(job, vt="non analysé", processed=False)  # à refaire une fois le problème réglé
+                if isinstance(e, postprocess.MissingApiKey):
+                    self.calls.put(self._api_key_dialog)
                 return status(f"Analyse VirusTotal impossible : {e}. Extraction non lancée.", done=True,
                               kind="error")
             self.last_report = report
@@ -621,7 +833,7 @@ class App:
                 if winrar:
                     for job in batch:
                         if job.name.lower().endswith(".rar"):
-                            put(job, status="Extraction bloquée")
+                            set_state(job, State.BLOCKED, "Extraction bloquée : analyse VirusTotal")
                 more = f" (+{len(blocking) - 1})" if len(blocking) > 1 else ""
                 return status(f"Extraction bloquée — {blocking[0]}{more}. Clique « Rapport VirusTotal ».",
                               done=True, kind="error")
@@ -631,20 +843,42 @@ class App:
         todo = postprocess.archive_sets(batch)
         if not todo:
             return status("Rien de bloquant, aucune archive .rar à extraire.", done=True)
-        ok = 0
+        ok, failures = 0, []
         for first, group in todo.items():
+            name = os.path.basename(first)
             for job in group:
-                put(job, status="Extraction…")
+                set_state(job, State.CHECKING)
+            status(f"Vérification de {name} avant extraction…")
             try:
-                code = postprocess.extract(winrar, first)
+                dest = postprocess.prepare_extraction(winrar, first)
+            except (postprocess.ExtractionBlocked, OSError, subprocess.SubprocessError) as e:
+                log.warning("Extraction de %s bloquée : %s", first, e)
+                for job in group:
+                    set_state(job, State.BLOCKED, f"Extraction bloquée : {e}")
+                failures.append(f"{name} : {e}")
+                continue
+            for job in group:
+                set_state(job, State.EXTRACTING)
+            status(f"Extraction de {name}…")
+            try:
+                code = postprocess.extract(winrar, first, dest)
             except OSError as e:
                 log.exception("Extraction impossible")
                 code = str(e)
-            ok += code == 0
-            for job in group:
-                put(job, status="Extrait ✔" if code == 0 else f"Échec extraction (code {code})")
-        status(("Analyse OK, " if scan else "") + f"extraction terminée : {ok}/{len(todo)} archive(s) extraite(s).",
-               done=True, kind="ok" if ok == len(todo) else "warn")
+            if code == 0:
+                ok += 1
+                where = os.path.relpath(dest, os.path.dirname(first))
+                detail = "" if where == "." else f"Extrait ✔ dans {where}{os.sep}"
+                for job in group:
+                    set_state(job, State.EXTRACTED, detail)
+            else:
+                failures.append(f"{name} : code {code}")
+                for job in group:
+                    set_state(job, State.EXTRACT_FAILED, f"Échec extraction (code {code})")
+        message = ("Analyse OK, " if scan else "") + f"extraction : {ok}/{len(todo)} archive(s) extraite(s)."
+        if failures:
+            message += f" Problème — {failures[0]}" + (f" (+{len(failures) - 1})" if len(failures) > 1 else "")
+        status(message, done=True, kind="ok" if ok == len(todo) else "warn" if ok else "error")
 
     def _show_report(self):
         if not self.last_report:
@@ -671,9 +905,102 @@ class App:
         text.insert("1.0", self.last_report.render_text())
         text.configure(state="disabled")
 
+    def _api_key_dialog(self):
+        """Saisie, test et enregistrement (chiffré) de la clé API VirusTotal."""
+        from vtzip.config import resolve_api_key, store_api_key
+
+        if getattr(self, "key_window", None) and self.key_window.winfo_exists():
+            self.key_window.lift()
+            return
+        px = self.theme.px
+        self.key_window = win = tk.Toplevel(self.root)
+        win.title("Clé API VirusTotal")
+        win.transient(self.root)
+        win.resizable(False, False)
+        self.theme.decorate(win)
+        card = ttk.Frame(win, style="Card.TFrame", padding=(px(20), px(16), px(20), px(18)))
+        card.pack(fill="both", expand=True, padx=px(16), pady=px(16))
+        card.columnconfigure(0, weight=1)
+        ttk.Label(card, text="CLÉ API VIRUSTOTAL", style="Caption.TLabel").grid(row=0, column=0, sticky="w")
+        key_var = tk.StringVar(value=resolve_api_key() or "")
+        entry = ttk.Entry(card, textvariable=key_var, show="•", width=72)
+        entry.grid(row=1, column=0, sticky="ew", pady=(px(6), px(10)))
+        show_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(card, text="Afficher la clé", variable=show_var, style="Switch.TCheckbutton",
+                        command=lambda: entry.configure(show="" if show_var.get() else "•")).grid(
+            row=2, column=0, sticky="w")
+        info = tk.StringVar(value="Clé gratuite : virustotal.com, menu de ton profil > API key. "
+                                  "Elle est enregistrée chiffrée, lisible seulement par ton compte Windows.")
+        ttk.Label(card, textvariable=info, style="SurfaceMuted.TLabel", wraplength=px(560), justify="left").grid(
+            row=3, column=0, sticky="w", pady=(px(12), px(16)))
+        buttons = ttk.Frame(card, style="Surface.TFrame")
+        buttons.grid(row=4, column=0, sticky="e")
+
+        def valid():
+            key = key_var.get().strip()
+            if len(key) != 64 or not key.isalnum():
+                info.set("Une clé VirusTotal fait 64 caractères (chiffres et lettres).")
+                return None
+            return key
+
+        def test():
+            key = valid()
+            if not key:
+                return
+            info.set("Test en cours…")
+            test_btn.state(["disabled"])
+
+            def run():
+                from vtzip.vt import VirusTotalClient, VTError
+                try:
+                    VirusTotalClient(key, rpm=0, timeout=20).lookup_hash(EICAR_SHA256)
+                    message = "Clé valide ✔"
+                except VTError as e:
+                    message = f"Échec : {e}"
+
+                def show():
+                    if win.winfo_exists():
+                        info.set(message)
+                        test_btn.state(["!disabled"])
+                self.calls.put(show)
+            threading.Thread(target=run, daemon=True).start()
+
+        def save(_event=None):
+            key = valid()
+            if not key:
+                return
+            store_api_key(key)
+            win.destroy()
+            self._status("Clé VirusTotal enregistrée.", "ok")
+
+        ttk.Button(buttons, text="Obtenir une clé", command=lambda: os.startfile(VT_KEY_URL)).pack(side="left")
+        test_btn = ttk.Button(buttons, text="Tester", command=test)
+        test_btn.pack(side="left", padx=(px(8), 0))
+        ttk.Button(buttons, text="Enregistrer", style="Accent.TButton", command=save).pack(side="left", padx=(px(8), 0))
+        entry.bind("<Return>", save)
+        win.bind("<Escape>", lambda e: win.destroy())
+        entry.focus_set()
+
     def _on_close(self):
+        active = [j for j in self.jobs.values() if j.state in ACTIVE]
+        if active or self.busy:
+            lines = []
+            if active:
+                lines.append(f"{plural(len(active), 'téléchargement')} en cours ou en attente : "
+                             "ils seront mis en pause et pourront reprendre au prochain lancement.")
+            if self.busy:
+                lines.append("L'analyse ou l'extraction en cours sera interrompue.")
+            if not messagebox.askyesno("Quitter Haul ?", "\n\n".join(lines) + "\n\nQuitter Haul ?",
+                                       icon="warning", default="no", parent=self.root):
+                return
         self._save_config()
         self.engine.shutdown()
+        self._save_queue()
         if self.server:
             self.server.shutdown()
+        self.notifier.remove()
+        self.taskbar.set(notify.TaskbarProgress.NONE)
+        for timer in (*self.timers.values(), self.notification_timer):
+            if timer:
+                self.root.after_cancel(timer)
         self.root.destroy()

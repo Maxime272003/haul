@@ -1,4 +1,8 @@
-"""Après les téléchargements : analyse VirusTotal (vtzip) puis extraction WinRAR."""
+"""Après les téléchargements : analyse VirusTotal (vtzip) puis extraction WinRAR.
+
+Avant d'extraire, chaque archive est vérifiée : version de WinRAR, chemins de toutes les entrées
+(rien hors du dossier de destination), test d'intégrité de tous les volumes.
+"""
 
 import io
 import json
@@ -22,9 +26,17 @@ VOLUME_RE = re.compile(r"\.part(\d+)\.rar$", re.I)
 # attendu sur un crack (voir docs/vtzip.md). « error » bloque : un fichier non vérifié ne passe pas.
 BLOCKING_LEVELS = ("malicious", "suspicious", "error")
 
+# Versions antérieures : traversée de répertoire à l'extraction (CVE-2025-6218, CVE-2025-8088).
+MIN_WINRAR = (7, 13)
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 class ScanError(Exception):
     """L'analyse n'a pas pu avoir lieu (clé API absente, vtzip en erreur…)."""
+
+
+class MissingApiKey(ScanError):
+    pass
 
 
 # --- analyse VirusTotal ---
@@ -80,7 +92,7 @@ def scan(paths, notify=lambda message: None):
 
     api_key = resolve_api_key()
     if not api_key:
-        raise ScanError("clé API VirusTotal absente (commande : vtzip config set-key)")
+        raise MissingApiKey("clé API VirusTotal absente (bouton « Clé VirusTotal… »)")
     cache = ResultCache()
     client = VirusTotalClient(api_key, rpm=4, cache=cache,
                               on_wait=lambda s: notify(f"Quota VirusTotal atteint, pause de {s:.0f} s…"))
@@ -138,11 +150,123 @@ def archive_sets(jobs):
     return sets
 
 
-def extract(winrar, first_volume):
-    """Extrait dans le dossier de l'archive. Retourne le code de sortie de WinRAR (0 = succès).
+class ExtractionBlocked(Exception):
+    """L'archive ne doit pas être extraite (WinRAR vulnérable, chemin dangereux, archive corrompue…)."""
+
+
+def file_version(path):
+    """Version (majeure, mineure) d'un exécutable Windows, ou None."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        version = ctypes.WinDLL("version")
+        size = version.GetFileVersionInfoSizeW(str(path), None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not version.GetFileVersionInfoW(str(path), 0, size, buf):
+            return None
+        ptr, length = ctypes.c_void_p(), wintypes.UINT()
+        if not version.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(length)) or length.value < 16:
+            return None
+        ms = ctypes.cast(ptr, ctypes.POINTER(wintypes.DWORD))[2]  # VS_FIXEDFILEINFO.dwFileVersionMS
+        return ms >> 16, ms & 0xFFFF
+    except (OSError, AttributeError):
+        return None
+
+
+def winrar_problem(winrar):
+    """Message si ce WinRAR ne doit pas extraire d'archives téléchargées, sinon None."""
+    v = file_version(winrar)
+    if v is None:
+        return None  # version illisible : on ne bloque pas pour autant
+    if v < MIN_WINRAR:
+        return (f"WinRAR {v[0]}.{v[1]:02d} a des failles connues à l'extraction (CVE-2025-6218, CVE-2025-8088) : "
+                f"installe WinRAR {MIN_WINRAR[0]}.{MIN_WINRAR[1]} ou plus récent")
+    return None
+
+
+def find_unrar(winrar):
+    """UnRAR (console, sans fenêtre) livré avec WinRAR."""
+    for name in ("UnRAR.exe", "Rar.exe"):
+        path = os.path.join(os.path.dirname(winrar), name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _run_unrar(unrar, *args, timeout=None):
+    # -p- : ne jamais demander de mot de passe ; -y : pas de question (volume manquant…)
+    return subprocess.run([unrar, *args, "-p-", "-y", "--"], capture_output=True, text=True, errors="replace",
+                          stdin=subprocess.DEVNULL, creationflags=NO_WINDOW, timeout=timeout)
+
+
+def list_entries(unrar, first_volume):
+    """Noms de toutes les entrées de l'archive, tous volumes compris."""
+    r = _run_unrar(unrar, "lb", "-v", first_volume, timeout=300)
+    if r.returncode != 0:
+        raise ExtractionBlocked(f"archive illisible ou volume manquant (UnRAR code {r.returncode})")
+    return list(dict.fromkeys(line.strip() for line in r.stdout.splitlines() if line.strip()))
+
+
+def unsafe_entry(name):
+    """Chemin qui écrirait hors du dossier d'extraction : absolu, lecteur, « .. », flux NTFS (« : »)."""
+    n = name.replace("\\", "/")
+    return n.startswith("/") or ":" in n or any(part == ".." for part in n.split("/"))
+
+
+def archive_base(first_volume):
+    name = os.path.basename(first_volume)
+    m = VOLUME_RE.search(name)
+    return name[:m.start()] if m else os.path.splitext(name)[0]
+
+
+def extraction_dir(first_volume, entries):
+    """Dossier de l'archive si tout son contenu est dans un seul dossier, sinon un sous-dossier à son nom.
+
+    Évite d'éparpiller (et d'écraser) des fichiers en vrac dans le dossier de téléchargement.
+    """
+    folder = os.path.dirname(first_volume)
+    parts = [e.replace("\\", "/").split("/", 1) for e in entries]
+    tops = {p[0].lower() for p in parts}
+    if len(tops) == 1 and any(len(p) == 2 for p in parts):
+        return folder
+    return os.path.join(folder, archive_base(first_volume))
+
+
+def prepare_extraction(winrar, first_volume):
+    """Vérifie l'archive avant extraction et retourne le dossier de destination.
+
+    Lève ExtractionBlocked si WinRAR est vulnérable, si un chemin est dangereux ou si le test
+    d'intégrité échoue (volume manquant ou corrompu) : rien n'est alors écrit ni écrasé.
+    """
+    problem = winrar_problem(winrar)
+    if problem:
+        raise ExtractionBlocked(problem)
+    unrar = find_unrar(winrar)
+    if not unrar:
+        raise ExtractionBlocked("UnRAR introuvable à côté de WinRAR : archive non vérifiable")
+    entries = list_entries(unrar, first_volume)
+    if not entries:
+        raise ExtractionBlocked("archive vide ou illisible")
+    bad = [e for e in entries if unsafe_entry(e)]
+    if bad:
+        raise ExtractionBlocked(f"chemin dangereux dans l'archive ({bad[0][:80]})")
+    r = _run_unrar(unrar, "t", "-idq", first_volume)
+    if r.returncode != 0:
+        detail = (r.stdout.strip() or r.stderr.strip()).splitlines()
+        raise ExtractionBlocked(f"archive corrompue ou incomplète (code {r.returncode}"
+                                + (f" : {detail[0][:80]}" if detail else "") + ")")
+    return extraction_dir(first_volume, entries)
+
+
+def extract(winrar, first_volume, dest=None):
+    """Extrait dans `dest` (par défaut le dossier de l'archive). Retourne le code de sortie de WinRAR.
 
     x : extraire avec les dossiers ; -u : extraire et mettre à jour ; -o+ : remplacer sans demander
     """
-    cmd = [winrar, "x", "-u", "-o+", first_volume, os.path.dirname(first_volume) + os.sep]
+    dest = dest or os.path.dirname(first_volume)
+    os.makedirs(dest, exist_ok=True)
+    cmd = [winrar, "x", "-u", "-o+", first_volume, dest.rstrip("\\/") + os.sep]
     log.info("Extraction : %s", subprocess.list2cmdline(cmd))
     return subprocess.run(cmd).returncode

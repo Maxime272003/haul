@@ -15,7 +15,7 @@ vtzip fait partie du dépôt Haul (`src/vtzip`) et s'installe avec lui :
 
 ```powershell
 .venv\Scripts\python -m pip install -e ".[dev]"   # depuis la racine du dépôt
-.venv\Scripts\vtzip config set-key                # ta clé API (masquée à la saisie)
+.venv\Scripts\vtzip config set-key                # ta clé API (masquée, chiffrée DPAPI sous Windows)
 ```
 
 Clé API : compte gratuit sur [virustotal.com](https://www.virustotal.com), menu profil >

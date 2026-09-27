@@ -14,8 +14,9 @@ class FileServer(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, data, ranges=True, max_conns=None, html=False):
+    def __init__(self, data, ranges=True, max_conns=None, html=False, wrong_range=False):
         self.data, self.ranges, self.max_conns, self.html = data, ranges, max_conns, html
+        self.wrong_range = wrong_range  # ignore le début demandé (hors sonde) : réponse à ne pas écrire
         self.active = 0
         self.peak = 0
         self.lock = threading.Lock()
@@ -53,6 +54,8 @@ class _Handler(BaseHTTPRequestHandler):
             a, b = 0, len(srv.data) - 1
             if m:
                 a, b = int(m.group(1)), int(m.group(2)) if m.group(2) else len(srv.data) - 1
+                if srv.wrong_range and a > 0:
+                    a, b = 0, b - a
                 self.send_response(206)
                 self.send_header("Content-Range", f"bytes {a}-{b}/{len(srv.data)}")
             else:
