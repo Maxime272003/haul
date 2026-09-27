@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Outils
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Construction de l'exécutable (PyInstaller)
+build/
+dist/
+*.spec
+
+# Téléchargements partiels et données locales
+*.part
+*.part.json
+*.log
+
+# Éditeurs / système
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
