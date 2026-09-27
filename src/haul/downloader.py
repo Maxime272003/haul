@@ -17,13 +17,21 @@ MIN_SEGMENT = 4 << 20
 MAX_SEGMENT = 256 << 20
 TIMEOUT = (15, 60)  # connexion, inactivité
 MAX_RETRIES = 6
+PROBE_BACKOFF = (5, 15, 30)  # s d'attente quand la sonde reçoit 429/503
 WRITE_BUFFER = 1 << 20
 
 CONTENT_RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)")
 
 
 class Refused(Exception):
-    """Le serveur a renvoyé une page (captcha, erreur) au lieu du fichier."""
+    """Le serveur a renvoyé une page (captcha, erreur) au lieu du fichier.
+
+    busy : il répondait encore 429/503 (trop de connexions) après les attentes de la sonde.
+    """
+
+    def __init__(self, reason=None, busy=False):
+        super().__init__(reason)
+        self.busy = busy
 
 
 class Cancelled(Exception):
@@ -32,6 +40,39 @@ class Cancelled(Exception):
 
 class Throttled(IOError):
     """Le serveur refuse une connexion de plus (429/503)."""
+
+
+def _set_sparse(f):
+    """Marque le fichier « creux » (NTFS) : les zones jamais écrites n'occupent pas le disque."""
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                             wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                             wintypes.LPVOID]
+        returned = wintypes.DWORD()
+        fsctl_set_sparse = 0x000900C4
+        return bool(kernel32.DeviceIoControl(msvcrt.get_osfhandle(f.fileno()), fsctl_set_sparse, None, 0, None, 0,
+                                             ctypes.byref(returned), None))
+    except (ImportError, OSError, AttributeError):
+        return False
+
+
+def allocate(path, size):
+    """Crée le fichier à sa taille finale sans écrire de zéros.
+
+    f.truncate(size) les écrit sous Windows (10 Go = ~10 s de disque avant le premier octet reçu, et
+    chaque octet écrit deux fois). Un fichier creux obtient sa taille immédiatement ; ailleurs,
+    écrire le dernier octet laisse un trou que le système ne remplit pas.
+    """
+    with open(path, "wb") as f:
+        if os.name == "nt":
+            _set_sparse(f)  # FAT32 / exFAT : refusé, on retombe sur le remplissage par le système
+        if size:
+            f.seek(size - 1)
+            f.write(b"\0")
 
 
 def filename_from_headers(headers):
@@ -57,6 +98,7 @@ class Downloader:
         self.ranges = False
         self.filename = None
         self.active_connections = 0
+        self.refusals = 0  # connexions refusées par le serveur (429/503) : trop de connexions
         # Octets déjà sur le disque au démarrage + un compteur par connexion : chaque thread
         # n'écrit que le sien, la somme se lit sans verrou.
         self._base = 0
@@ -86,32 +128,46 @@ class Downloader:
         self._stop.set()
 
     def probe(self):
-        """Vérifie que le serveur sert bien le fichier et récupère taille / support des Range."""
-        last = None
+        """Vérifie que le serveur sert bien le fichier et récupère taille / support des Range.
+
+        Un 429/503 veut dire « trop de connexions pour l'instant » (d'autres fichiers en cours) :
+        on patiente et on redemande au lieu de conclure que le lien est refusé.
+        """
+        last, status = None, None
         for headers, cookies in self.attempts:
             self.headers, self.cookies = headers, cookies
-            s = self._session()
-            try:
-                r = s.get(self.url, headers={"Range": "bytes=0-0"}, stream=True, timeout=TIMEOUT)
-                try:
-                    ctype = r.headers.get("Content-Type", "")
-                    if r.status_code not in (200, 206) or "text/html" in ctype:
-                        last = f"HTTP {r.status_code}"
-                        continue
-                    self.filename = filename_from_headers(r.headers)
-                    m = re.search(r"/(\d+)$", r.headers.get("Content-Range", ""))
-                    if r.status_code == 206 and m:
-                        self.total, self.ranges = int(m.group(1)), True
-                    elif r.headers.get("Content-Length"):
-                        self.total = int(r.headers["Content-Length"])
+            for wait in (*PROBE_BACKOFF, None):
+                status, last = self._probe_once(last)
+                if status == "ok":
                     return
-                finally:
-                    r.close()
-            except creq.RequestsError as e:
-                last = str(e)
+                if status != "busy" or wait is None or self._stop.wait(wait):
+                    break
+        raise Refused(last, busy=status == "busy")
+
+    def _probe_once(self, last):
+        """(« ok », « busy » (429/503) ou « refused », dernier motif d'échec)."""
+        s = self._session()
+        try:
+            r = s.get(self.url, headers={"Range": "bytes=0-0"}, stream=True, timeout=TIMEOUT)
+            try:
+                ctype = r.headers.get("Content-Type", "")
+                if r.status_code in (429, 503):
+                    return "busy", f"HTTP {r.status_code}"
+                if r.status_code not in (200, 206) or "text/html" in ctype:
+                    return "refused", f"HTTP {r.status_code}"
+                self.filename = filename_from_headers(r.headers)
+                m = re.search(r"/(\d+)$", r.headers.get("Content-Range", ""))
+                if r.status_code == 206 and m:
+                    self.total, self.ranges = int(m.group(1)), True
+                elif r.headers.get("Content-Length"):
+                    self.total = int(r.headers["Content-Length"])
+                return "ok", last
             finally:
-                s.close()
-        raise Refused(last)
+                r.close()
+        except creq.RequestsError as e:
+            return "refused", str(e)
+        finally:
+            s.close()
 
     def download(self, final_path, on_progress):
         part = final_path + ".part"
@@ -129,8 +185,7 @@ class Downloader:
         if segments is None:
             size = max(MIN_SEGMENT, min(MAX_SEGMENT, self.total // (self.connections * 4)))
             segments = [[start, min(start + size, self.total) - 1, start] for start in range(0, self.total, size)]
-            with open(part, "wb") as f:
-                f.truncate(self.total)
+            allocate(part, self.total)
         self._base = sum(pos - start for start, _, pos in segments)
         todo = [seg for seg in segments if seg[2] <= seg[1]]
         n_workers = min(self.connections, len(todo))
@@ -154,6 +209,7 @@ class Downloader:
                         except Throttled:
                             # Trop de connexions : on rend le segment et on laisse les autres continuer.
                             with self._lock:
+                                self.refusals += 1
                                 todo.insert(0, seg)
                                 if alive[0] > 1:
                                     return

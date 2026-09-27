@@ -91,6 +91,10 @@ class Job:
         return self.detail or LABELS[self.state]
 
 
+class ServerBusy(Exception):
+    """Le serveur refuse une connexion de plus (429/503) même après attente."""
+
+
 def error_detail(e):
     return f"Erreur : {str(e).splitlines()[0][:120] if str(e) else type(e).__name__}"
 
@@ -139,6 +143,7 @@ class Engine:
         self._waiting = {}  # page_key -> (job, threading.Event)
         self._dl_pending = []
         self._dl_active = 0
+        self._busy_cap = None  # fichiers simultanés acceptés par le serveur (429 au-delà), jusqu'à une fin
         self._downloaders = {}  # job.id -> Downloader en cours
         self._paths = set()  # fichiers en cours d'écriture
         self._paused = set()  # job.id mis en pause
@@ -280,16 +285,34 @@ class Engine:
 
     def _pump(self):
         with self._lock:
-            while self._dl_active < self.max_parallel and self._dl_pending:
+            limit = min(self.max_parallel, self._busy_cap or self.max_parallel)
+            while self._dl_active < limit and self._dl_pending:
                 job = self._dl_pending.pop(0)
                 self._dl_active += 1
                 threading.Thread(target=self._run_download, args=(job,), daemon=True).start()
 
     def _run_download(self, job):
+        requeued = False
         try:
             self._download(job)
         except Cancelled:
             self.set_state(job, State.PAUSED, speed=0)
+        except ServerBusy as e:
+            # Le serveur n'accepte pas un fichier de plus : on attend qu'un autre se termine au lieu
+            # de mettre celui-ci en erreur (et de perdre son lien direct).
+            with self._lock:
+                others = self._dl_active - 1
+                requeued = others > 0 and job.id not in self._paused
+                if requeued:
+                    self._busy_cap = others
+                    self._dl_pending.insert(0, job)
+            if requeued:
+                log.warning("Serveur saturé (%s) : %d fichier(s) simultané(s) au plus pour l'instant", e, others)
+                self.set_state(job, State.QUEUED, f"En attente : le serveur limite à {others} fichier(s) à la fois",
+                               speed=0)
+            else:
+                self.set_state(job, State.ERROR, f"Erreur : le serveur refuse la connexion ({e}), réessaie plus tard",
+                               speed=0)
         except Exception as e:
             log.exception("Échec %s", job.url)
             self.set_state(job, State.ERROR, error_detail(e), speed=0)
@@ -297,6 +320,8 @@ class Engine:
             with self._lock:
                 self._dl_active -= 1
                 self._downloaders.pop(job.id, None)
+                if not requeued:
+                    self._busy_cap = None  # une place s'est libérée
             self._pump()
 
     def _download(self, job):
@@ -312,6 +337,8 @@ class Engine:
         try:
             d.probe()
         except Refused as e:
+            if e.busy:
+                raise ServerBusy(str(e)) from e  # lien valable, serveur saturé : on le garde
             job.dl_url = None  # lien sans doute expiré : « Réessayer » rouvrira la page
             raise RuntimeError(f"le serveur refuse le téléchargement ({e})") from e
         if d.cancelled:

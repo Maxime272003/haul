@@ -91,3 +91,27 @@ def test_speed_limit_slows_download(file_server, tmp_path):
     d.download(str(tmp_path / "f.bin"), lambda done, total: None)
     assert time.monotonic() - start > 2  # 12 Mo à 4 Mo/s ; sans limite, moins d'une seconde
     assert (tmp_path / "f.bin").read_bytes() == DATA
+
+
+def test_allocate_sets_final_size_without_writing_zeros(tmp_path):
+    path = tmp_path / "big.part"
+    start = time.monotonic()
+    downloader.allocate(str(path), 8 << 30)  # 8 Go : écrire les zéros prendrait plusieurs secondes
+    assert time.monotonic() - start < 2
+    assert path.stat().st_size == 8 << 30
+    with open(path, "r+b") as f:  # écriture au milieu, comme un segment
+        f.seek(5 << 30)
+        f.write(b"abc")
+    with open(path, "rb") as f:
+        f.seek((5 << 30) - 2)
+        assert f.read(5) == b"\0\0abc"
+
+
+def test_probe_waits_when_server_is_busy(file_server, monkeypatch):
+    monkeypatch.setattr(downloader, "PROBE_BACKOFF", (0.05, 0.05))
+    srv = file_server(busy_first=2)  # autres fichiers en cours : 429 le temps qu'une connexion se libère
+    d = Downloader(srv.url, "x", NO_AUTH)
+    d.probe()
+    assert d.total == len(DATA)
+    with pytest.raises(Refused, match="429"):
+        Downloader(file_server(busy_first=5).url, "x", NO_AUTH).probe()

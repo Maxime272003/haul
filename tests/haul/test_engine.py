@@ -172,3 +172,39 @@ def test_speed_limit_is_shared_between_connections(tmp_path):
         active_connections = 4
     engine._downloaders = {1: D(), 2: D()}
     assert engine._connection_speed() == 1 << 20
+
+
+def test_busy_server_requeues_file_until_another_one_finishes(tmp_path):
+    from haul.engine import ServerBusy
+
+    events = queue.Queue()
+    engine = Engine(events, lambda *link: None, open_page=lambda url: None)
+    engine.set_parallel(3)
+    first_running, first_done, calls = threading.Event(), threading.Event(), []
+
+    def fake_download(job):
+        calls.append(job.id)
+        if job.id == 1:
+            first_running.set()
+            first_done.wait(5)
+        elif job.id == 2 and calls.count(2) == 1:
+            raise ServerBusy("HTTP 429")  # le serveur n'accepte pas un 2e fichier pour l'instant
+
+    engine._download = fake_download
+    jobs = [Job(i, f"https://fuckingfast.co/{i}", str(tmp_path), dl_url=f"https://dl.fuckingfast.co/dl/{i}")
+            for i in (1, 2, 3)]
+    engine.submit(jobs[0])
+    assert first_running.wait(5)
+    engine.submit(jobs[1])
+    fields = wait_state(events, 2, State.QUEUED)
+    while "limite" not in fields.get("detail", ""):
+        fields = wait_state(events, 2, State.QUEUED)
+    engine.submit(jobs[2])  # plafond : 1 fichier à la fois tant que le 1er tourne
+    time.sleep(0.3)
+    assert calls == [1, 2]
+    assert jobs[1].dl_url  # lien gardé
+    first_done.set()
+    deadline = time.monotonic() + 5
+    while sorted(calls) != [1, 2, 2, 3] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert sorted(calls) == [1, 2, 2, 3]

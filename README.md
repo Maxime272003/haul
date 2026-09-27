@@ -99,7 +99,15 @@ py -3.12 -m venv .venv
 | Puis extraire avec WinRAR | Extrait les archives si l'analyse ne bloque pas. |
 | Notifications | Prévient quand la fenêtre n'est pas au premier plan : captcha à valider, liste terminée, extraction terminée ou bloquée. |
 
-Boutons : **Tout reprendre** (fichiers en pause), **Réessayer les échecs** (reprend là où le
+Boutons :
+
+- **Mettre en pause / Reprendre** : agit sur les fichiers sélectionnés (<kbd>Ctrl</kbd>+<kbd>A</kbd>
+  pour tout sélectionner) ; le libellé suit la sélection ;
+- **Tout suspendre / Tout reprendre** : met toute la liste en pause (fichiers partiels gardés, la
+  reprise repart de là). Tant que Haul est suspendu, les liens copiés sont ajoutés en pause au
+  lieu d'ouvrir des pages dans le navigateur ;
+
+puis **Réessayer les échecs** (reprend là où le
 fichier s'était arrêté, rouvre la page si le lien a expiré), **Retirer les terminés**,
 **Analyser / extraire maintenant**, **Rapport VirusTotal** (rapport détaillé de vtzip),
 **Installer le script navigateur**. Un bouton est grisé quand il n'a rien à faire.
@@ -193,7 +201,7 @@ enregistrée en clair par une version précédente est chiffrée à la première
 │   │   └── assets/            userscript, icône
 │   └── vtzip/                 vérification VirusTotal (aussi utilisable en ligne de commande)
 ├── tests/                     pytest : haul/ et vtzip/
-├── scripts/                   build.ps1 (exécutable), make_icon.py
+├── scripts/                   build.ps1 (exécutable), bench.py (débit), make_icon.py
 └── docs/vtzip.md              documentation de vtzip
 ```
 
@@ -205,6 +213,19 @@ enregistrée en clair par une version précédente est chiffrée à la première
 ```
 
 vtzip reste utilisable seul : `.venv\Scripts\vtzip --deep C:\chemin\du\dossier`.
+
+### Mesurer le débit
+
+`scripts/bench.py` télécharge avec le vrai téléchargeur de Haul chaque combinaison *fichiers
+simultanés × connexions par fichier* (de 1 à 6 × 1 à 16) pendant 30 s, et classe les résultats :
+
+```powershell
+.venv\Scripts\python scripts\bench.py https://nbg1-speed.hetzner.com/10GB.bin
+.venv\Scripts\python scripts\bench.py <lien direct dl.fuckingfast.co> --configs 1x4,2x4,2x8,3x4
+```
+
+Pour FuckingFast, le lien direct se trouve dans `%APPDATA%\Haul\haul.log` (ligne « Lien reçu
+pour … ») ; il expire, lance le benchmark juste après l'avoir récupéré.
 
 ## Licence
 

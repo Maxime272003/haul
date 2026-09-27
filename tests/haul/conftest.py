@@ -14,8 +14,9 @@ class FileServer(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, data, ranges=True, max_conns=None, html=False, wrong_range=False):
+    def __init__(self, data, ranges=True, max_conns=None, html=False, wrong_range=False, busy_first=0):
         self.data, self.ranges, self.max_conns, self.html = data, ranges, max_conns, html
+        self.busy_first = busy_first  # nombre de premières requêtes refusées (429)
         self.wrong_range = wrong_range  # ignore le début demandé (hors sonde) : réponse à ne pas écrire
         self.active = 0
         self.peak = 0
@@ -42,7 +43,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         with srv.lock:
-            if srv.max_conns and srv.active >= srv.max_conns:
+            busy = srv.busy_first > 0
+            srv.busy_first -= busy
+            if busy or (srv.max_conns and srv.active >= srv.max_conns):
                 self.send_response(429)
                 self.send_header("Content-Length", "0")
                 self.end_headers()

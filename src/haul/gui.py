@@ -100,6 +100,7 @@ class App:
         self.seen = set()
         self.next_id = 1
         self.busy = False       # analyse / extraction en cours
+        self.suspended = False  # « Tout suspendre » : les nouveaux liens arrivent en pause
         self.last_report = None
         self.tick = 0           # animation des icônes « en cours »
         self.queue_dirty = False
@@ -303,6 +304,8 @@ class App:
         self.tree.bind("<Double-1>", lambda e: self._reveal(self._job_at(e.y)))
         self.tree.bind("<Delete>", lambda e: self._remove(self._selected_jobs()))
         self.tree.bind("<space>", lambda e: self._toggle_pause(self._selected_jobs()))
+        self.tree.bind("<Control-a>", lambda e: self.tree.selection_set(self.tree.get_children()) or "break")
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._refresh_pause_button(), add="+")
 
         self.empty = ttk.Frame(card, style="Surface.TFrame")
         ttk.Label(self.empty, text="Aucun téléchargement", style="EmptyTitle.TLabel").pack()
@@ -367,13 +370,17 @@ class App:
     def _build_actions(self, parent):
         px = self.theme.px
         actions = Flow(parent, gap=px(8), row_gap=px(8))
-        self.resume_btn = ttk.Button(actions, text="Tout reprendre", command=self._resume_all)
+        # libellés mis à jour par _refresh selon la sélection et l'état de la liste
+        self.pause_btn = ttk.Button(actions, text="Mettre en pause",
+                                    command=lambda: self._toggle_pause(self._selected_jobs()))
+        self.suspend_btn = ttk.Button(actions, text="Tout suspendre", command=self._toggle_suspend)
         self.retry_btn = ttk.Button(actions, text="Réessayer les échecs", command=self._retry_failed)
         self.clear_btn = ttk.Button(actions, text="Retirer les terminés", command=self._clear_done)
         self.process_btn = ttk.Button(actions, text="Analyser / extraire maintenant",
                                       command=lambda: self._postprocess(manual=True))
         self.report_btn = ttk.Button(actions, text="Rapport VirusTotal", command=self._show_report)
-        actions.add(self.resume_btn, self.retry_btn, self.clear_btn, self.process_btn, self.report_btn)
+        actions.add(self.pause_btn, self.suspend_btn, self.retry_btn, self.clear_btn, self.process_btn,
+                    self.report_btn)
         return actions
 
     def _build_statusbar(self):
@@ -552,8 +559,27 @@ class App:
         else:
             self._resume(jobs)
 
+    def _suspend_all(self):
+        """Met tout en pause ; les liens ajoutés ensuite arrivent en pause jusqu'à « Tout reprendre »."""
+        self.suspended = True
+        self._pause(list(self.jobs.values()))
+        self._status("Téléchargements suspendus : les fichiers partiels sont gardés, « Tout reprendre » "
+                     "repart de là. Les liens ajoutés entre-temps attendent en pause.", "warn")
+
     def _resume_all(self):
+        self.suspended = False
         self._resume(list(self.jobs.values()))
+
+    def _toggle_suspend(self):
+        if self._suspend_label() == "Tout suspendre":
+            self._suspend_all()
+        else:
+            self._resume_all()
+
+    def _suspend_label(self):
+        active = any(j.state in ACTIVE for j in self.jobs.values())
+        paused = any(j.state == State.PAUSED for j in self.jobs.values())
+        return "Tout reprendre" if self.suspended or (paused and not active) else "Tout suspendre"
 
     # --- presse-papier ---
 
@@ -606,10 +632,11 @@ class App:
         if page_key(url) in self.seen:
             return False
         job = Job(id=self.next_id, url=url, dest=self.folder_var.get(), name=name_from_url(url),
-                  dl_url=dl_url, user_agent=user_agent)
+                  dl_url=dl_url, user_agent=user_agent, state=State.PAUSED if self.suspended else State.WAITING)
         self.next_id += 1
         self._insert(job)
-        self.engine.submit(job)
+        if not self.suspended:
+            self.engine.submit(job)
         return True
 
     # --- liste sauvegardée ---
@@ -729,7 +756,7 @@ class App:
 
         if self.jobs:
             self.empty.place_forget()
-            parts = [plural(len(self.jobs), "fichier")]
+            parts = (["suspendu"] if self.suspended else []) + [plural(len(self.jobs), "fichier")]
             active = kinds.get("download", 0) + kinds.get("busy", 0) + kinds.get("browser", 0)
             for n, text in ((active, "en cours"), (kinds.get("wait", 0), "en attente"),
                             (kinds.get("paused", 0), "en pause"),
@@ -747,12 +774,27 @@ class App:
 
         def enable(button, on):
             button.state(["!disabled"] if on else ["disabled"])
-        enable(self.resume_btn, kinds.get("paused", 0))
+        self._refresh_pause_button()
+        label = self._suspend_label()
+        if self.suspend_btn.cget("text") != label:
+            self.suspend_btn.configure(text=label)
+        enable(self.suspend_btn, self.suspended or kinds.get("paused", 0) or any(
+            j.state in ACTIVE for j in self.jobs.values()))
         enable(self.retry_btn, any(j.state == State.ERROR for j in self.jobs.values()))
         enable(self.clear_btn, kinds.get("done", 0))
         enable(self.process_btn, not self.busy and any(j.state in ON_DISK for j in self.jobs.values()))
         enable(self.report_btn, self.last_report is not None)
         return kinds
+
+    def _refresh_pause_button(self):
+        """« Mettre en pause » ou « Reprendre » selon la sélection."""
+        selected = self._selected_jobs()
+        active = any(j.state in ACTIVE for j in selected)
+        paused = any(j.state == State.PAUSED for j in selected)
+        label = "Reprendre" if paused and not active else "Mettre en pause"
+        if self.pause_btn.cget("text") != label:
+            self.pause_btn.configure(text=label)
+        self.pause_btn.state(["!disabled"] if active or paused else ["disabled"])
 
     def _retry(self, jobs):
         for job in jobs:

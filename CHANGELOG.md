@@ -10,6 +10,13 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), ver
 - Un fichier déjà présent mais tronqué était considéré comme terminé : sa taille est maintenant
   comparée à celle annoncée par le serveur.
 - Un segment reçu avec une autre plage que celle demandée n'est plus écrit dans le fichier.
+- Démarrage des gros téléchargements : le fichier `.part` était agrandi à sa taille finale en
+  écrivant des zéros (Python sous Windows), soit ~10 s de disque avant le premier octet pour
+  10 Go, et chaque octet écrit deux fois. Il est maintenant créé « creux » (NTFS) : instantané.
+- Un 429/503 à la connexion (serveur occupé par les autres fichiers) mettait le fichier en erreur
+  et lui faisait perdre son lien direct : Haul patiente et redemande (5, 15 puis 30 s). Si le
+  serveur refuse toujours, le fichier retourne en file (lien gardé) et le nombre de fichiers
+  simultanés est ramené à ce que le serveur accepte, jusqu'à ce qu'un téléchargement se termine.
 
 ### Modifié
 - Écriture des téléchargements bufferisée (un fichier ouvert par connexion, tampon de 1 Mo),
@@ -38,8 +45,13 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), ver
 - Clé API VirusTotal chiffrée avec DPAPI ; une ancienne clé en clair est chiffrée à la première lecture.
 
 ### Ajouté
-- Pause / reprise par fichier (menu contextuel, touche Espace, « Tout reprendre ») ; *Passer ce
+- Pause / reprise par fichier : bouton *Mettre en pause / Reprendre* pour la sélection
+  (<kbd>Ctrl</kbd>+<kbd>A</kbd> pour tout sélectionner), menu contextuel, touche Espace ; *Passer ce
   lien* pour une page qui attend un captcha ; *Rouvrir la page*.
+- *Tout suspendre / Tout reprendre* : met toute la liste en pause ; tant que Haul est suspendu,
+  les liens ajoutés arrivent en pause au lieu d'ouvrir des pages.
+- `scripts/bench.py` : mesure le débit de chaque combinaison fichiers simultanés × connexions
+  par fichier avec le vrai téléchargeur (voir README, *Mesurer le débit*).
 - Liste des téléchargements sauvegardée (`%APPDATA%\Haul\queue.json`) et retrouvée au lancement
   suivant, les téléchargements interrompus en pause. Confirmation avant de quitter pendant des
   téléchargements.
