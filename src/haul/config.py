@@ -12,6 +12,7 @@ DEFAULTS = {
     "watch": True,       # surveiller le presse-papier
     "scan": True,        # analyse VirusTotal quand toute la liste est téléchargée
     "extract": True,     # puis extraction WinRAR
+    "theme": "system",   # apparence : system (celle de Windows), light ou dark
 }
 
 

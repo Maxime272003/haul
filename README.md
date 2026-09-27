@@ -88,12 +88,25 @@ py -3.12 -m venv .venv
 | Surveiller le presse-papier | Ajoute automatiquement les liens copiés. |
 | Fichiers simultanés | Nombre de fichiers téléchargés en même temps (2–3 conseillés). |
 | Connexions par fichier | Découpage de chaque fichier (8 conseillé). |
-| Analyser (VirusTotal) | Analyse le lot quand toute la liste est téléchargée. |
-| puis extraire (WinRAR) | Extrait les archives si l'analyse ne bloque pas. |
+| Analyser avec VirusTotal | Analyse le lot quand toute la liste est téléchargée. |
+| Puis extraire avec WinRAR | Extrait les archives si l'analyse ne bloque pas. |
 
 Boutons : **Réessayer les échecs** (reprend là où le fichier s'était arrêté, rouvre la page si le
-lien a expiré), **Analyser / extraire maintenant**, **Rapport VirusTotal** (rapport détaillé de
-vtzip), **Installer le script navigateur**.
+lien a expiré), **Retirer les terminés**, **Analyser / extraire maintenant**, **Rapport VirusTotal**
+(rapport détaillé de vtzip), **Installer le script navigateur**. Un bouton est grisé quand il n'a
+rien à faire.
+
+Dans la liste :
+
+- une ligne sélectionnée affiche son statut complet dans la barre d'état, et un texte trop long
+  pour sa colonne s'affiche en entier au survol ;
+- clic droit : *Afficher dans l'Explorateur*, *Copier le lien de la page*, *Réessayer*,
+  *Retirer de la liste* ; double-clic : afficher le fichier ; <kbd>Suppr</kbd> : retirer ;
+- <kbd>Ctrl</kbd>+<kbd>V</kbd> dans la fenêtre ajoute les liens du presse-papier (utile quand la
+  surveillance est désactivée).
+
+L'apparence suit le mode clair ou sombre de Windows ; pour l'imposer, mets `"theme": "light"` ou
+`"theme": "dark"` dans `config.json` (voir [Données](#données)).
 
 ### Politique d'extraction
 
@@ -105,13 +118,13 @@ vtzip), **Installer le script navigateur**.
 
 Un repack recompressé est presque toujours *inconnu* de VirusTotal, et les détections
 génériques sont le bruit attendu sur un crack : voir [docs/vtzip.md](docs/vtzip.md). Pour extraire
-malgré un blocage, décoche *Analyser* puis clique *Analyser / extraire maintenant*.
+malgré un blocage, désactive *Analyser avec VirusTotal* puis clique *Analyser / extraire maintenant*.
 
 ## Données
 
 | Emplacement | Contenu |
 | --- | --- |
-| `%APPDATA%\Haul\config.json` | Réglages de l'application |
+| `%APPDATA%\Haul\config.json` | Réglages de l'application (dont `theme` : `system`, `light` ou `dark`) |
 | `%APPDATA%\Haul\haul.log` | Journal (liens reçus, erreurs, extractions) |
 | `%APPDATA%\Haul\reports\` | Rapports VirusTotal au format JSON |
 | `%APPDATA%\vtzip\` | Clé API et cache des résultats VirusTotal (24 h) |
@@ -123,6 +136,8 @@ malgré un blocage, décoche *Analyser* puis clique *Analyser / extraire mainten
 │   ├── haul/                  application
 │   │   ├── __main__.py        point d'entrée (haul, python -m haul, Haul.exe)
 │   │   ├── gui.py             fenêtre Tkinter
+│   │   ├── theme.py           apparence : palette claire/sombre, styles ttk, formes dessinées
+│   │   ├── widgets.py         disposition fluide, sélecteur numérique, infobulles
 │   │   ├── engine.py          file de téléchargements, ouverture des pages
 │   │   ├── downloader.py      téléchargement segmenté avec reprise (curl_cffi)
 │   │   ├── server.py          serveur local pour le userscript
