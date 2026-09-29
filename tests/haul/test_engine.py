@@ -208,3 +208,18 @@ def test_busy_server_requeues_file_until_another_one_finishes(tmp_path):
     while sorted(calls) != [1, 2, 2, 3] and time.monotonic() < deadline:
         time.sleep(0.05)
     assert sorted(calls) == [1, 2, 2, 3]
+
+
+def test_pause_with_discard_deletes_partial_file_once_stopped(tmp_path, file_server):
+    srv = file_server()
+    events = queue.Queue()
+    engine = Engine(events, lambda *link: None, open_page=lambda url: None)
+    engine.set_connections(2)
+    job = Job(1, "https://fuckingfast.co/a#f.bin", str(tmp_path), name="f.bin", dl_url=srv.url)
+    engine.submit(job)
+    wait_state(events, 1, State.DOWNLOADING)
+    time.sleep(0.3)
+    assert (tmp_path / "f.bin.part").exists()
+    engine.pause(job, discard=True)  # « Tout supprimer » avec les téléchargements inachevés
+    wait_state(events, 1, State.PAUSED)
+    assert list(tmp_path.iterdir()) == []  # ni .part ni .part.json (réécrit à l'arrêt)

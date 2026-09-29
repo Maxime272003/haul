@@ -96,3 +96,4 @@ def test_arc_covers_only_requested_fraction():
     quarter = arc(10, 10, 8, 2, 0, 0.25)  # de midi à 3 h
     assert quarter(15.66, 4.34) < 0  # 45° : sur l'arc
     assert quarter(10, 18) > 0  # 6 h : hors de l'arc
+

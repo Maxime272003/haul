@@ -81,8 +81,9 @@ py -3.12 -m venv .venv
 ### Première utilisation
 
 1. Lance Haul, puis clique **Installer le script navigateur** : Violentmonkey propose
-   d'installer le userscript. *Mise à jour depuis une version précédente : réinstalle-le*, le
-   script contient désormais le jeton de ton installation (Haul le signale sinon).
+   d'installer le userscript. Il se synchronise ensuite tout seul avec Haul (jeton lu au moment
+   de l'utiliser, mises à jour automatiques) : pas besoin de le réinstaller. Seule exception, une
+   copie antérieure à la version 3.2 : Haul le signale, réinstalle-la une dernière fois.
 2. Clique **Clé VirusTotal…**, colle ta clé API, *Tester* puis *Enregistrer*.
 3. Copie une liste de liens `fuckingfast.co` depuis une page web : les téléchargements démarrent.
 
@@ -109,6 +110,8 @@ Boutons :
 
 puis **Réessayer les échecs** (reprend là où le
 fichier s'était arrêté, rouvre la page si le lien a expiré), **Retirer les terminés**,
+**Tout supprimer** (vide la liste après confirmation ; les fichiers terminés restent sur le disque,
+une option supprime aussi les téléchargements inachevés `.part`),
 **Analyser / extraire maintenant**, **Rapport VirusTotal** (rapport détaillé de vtzip),
 **Installer le script navigateur**. Un bouton est grisé quand il n'a rien à faire.
 
@@ -160,10 +163,11 @@ un sous-dossier à son nom : rien n'est éparpillé ni écrasé en vrac dans le 
 téléchargement.
 
 **Serveur local** : chaque requête du userscript porte un jeton secret, généré au premier
-lancement et inséré dans le script quand Haul le sert. Un site web ne peut donc pas injecter de
-lien, même depuis une iframe *sandbox*. L'en-tête `Host` est vérifié (DNS rebinding), la taille des
-requêtes est limitée, le script n'est pas servi à une balise `<script>` d'une page tierce, et
-seules les URL de page `https://fuckingfast.co/…` peuvent être ouvertes dans le navigateur.
+lancement. Le script le demande à Haul (`/token`) au moment de s'en servir : la réponse n'est
+lisible que par l'extension (pas d'en-tête CORS, refusée à toute page web, balise `<script>` ou
+iframe). Un site web ne peut donc pas injecter de lien, même depuis une iframe *sandbox*.
+L'en-tête `Host` est vérifié (DNS rebinding), la taille des requêtes est limitée, et seules les URL
+de page `https://fuckingfast.co/…` peuvent être ouvertes dans le navigateur.
 
 **Intégrité des téléchargements** : chaque segment reçu doit correspondre exactement à la plage
 demandée, et un fichier déjà présent n'est ignoré que s'il a la taille annoncée par le serveur.

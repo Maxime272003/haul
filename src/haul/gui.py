@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from . import __version__, clipboard, config, notify, postprocess
-from .engine import ACTIVE, ON_DISK, Engine, Job, State
+from .engine import ACTIVE, ON_DISK, Engine, Job, State, remove_partial
 from .links import FILE_HINT_RE, LINK_RE, human_size, is_page_url, name_from_url, page_key, safe_name
 from .paths import ICON_PATH, QUEUE_PATH
 from .server import PORT, USERSCRIPT_URL, LinkServer
@@ -131,7 +131,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         try:
             self.server = LinkServer(self.engine, self.cfg["token"],
-                                     on_bad_token=lambda: self.calls.put(self._script_outdated))
+                                     on_bad_token=lambda kind: self.calls.put(lambda: self._script_outdated(kind)))
             threading.Thread(target=self.server.serve_forever, daemon=True).start()
         except OSError:
             self.server = None
@@ -376,11 +376,12 @@ class App:
         self.suspend_btn = ttk.Button(actions, text="Tout suspendre", command=self._toggle_suspend)
         self.retry_btn = ttk.Button(actions, text="Réessayer les échecs", command=self._retry_failed)
         self.clear_btn = ttk.Button(actions, text="Retirer les terminés", command=self._clear_done)
+        self.clear_all_btn = ttk.Button(actions, text="Tout supprimer", command=self._clear_all_dialog)
         self.process_btn = ttk.Button(actions, text="Analyser / extraire maintenant",
                                       command=lambda: self._postprocess(manual=True))
         self.report_btn = ttk.Button(actions, text="Rapport VirusTotal", command=self._show_report)
-        actions.add(self.pause_btn, self.suspend_btn, self.retry_btn, self.clear_btn, self.process_btn,
-                    self.report_btn)
+        actions.add(self.pause_btn, self.suspend_btn, self.retry_btn, self.clear_btn, self.clear_all_btn,
+                    self.process_btn, self.report_btn)
         return actions
 
     def _build_statusbar(self):
@@ -425,9 +426,15 @@ class App:
         os.makedirs(folder, exist_ok=True)
         os.startfile(folder)
 
-    def _script_outdated(self):
-        self._status("Le script navigateur est à mettre à jour : clique « Installer le script navigateur » "
-                     "puis confirme dans Violentmonkey / Tampermonkey.", "warn")
+    def _script_outdated(self, kind):
+        """Requête refusée : kind « missing » (script sans jeton) ou « wrong » (jeton écrit dans un script 3.1)."""
+        if kind == "missing":
+            self._status("Une ancienne copie du script Haul (sans jeton) tourne encore dans un navigateur : "
+                         "supprime-la dans Violentmonkey / Tampermonkey, ou mets-la à jour avec « Installer le "
+                         "script navigateur ».", "warn")
+        else:
+            self._status("Le script navigateur est en version 3.1 : mets-le à jour une dernière fois (« Installer le "
+                         "script navigateur »). À partir de la 3.2, il se synchronise tout seul avec Haul.", "warn")
 
     # --- notifications ---
 
@@ -782,6 +789,7 @@ class App:
             j.state in ACTIVE for j in self.jobs.values()))
         enable(self.retry_btn, any(j.state == State.ERROR for j in self.jobs.values()))
         enable(self.clear_btn, kinds.get("done", 0))
+        enable(self.clear_all_btn, self.jobs)
         enable(self.process_btn, not self.busy and any(j.state in ON_DISK for j in self.jobs.values()))
         enable(self.report_btn, self.last_report is not None)
         return kinds
@@ -806,6 +814,67 @@ class App:
 
     def _clear_done(self):
         self._remove([j for j in self.jobs.values() if status_kind(j.state) == "done"])
+
+    def _clear_all_dialog(self):
+        """Confirmation de « Tout supprimer » : vide la liste, et au choix les téléchargements inachevés."""
+        jobs = list(self.jobs.values())
+        if not jobs:
+            return
+        if getattr(self, "clear_window", None) and self.clear_window.winfo_exists():
+            self.clear_window.lift()
+            return
+        px = self.theme.px
+        active = sum(j.state in ACTIVE for j in jobs)
+        unfinished = sum(j.state not in ON_DISK for j in jobs)
+        busy = sum(j.state in (State.CHECKING, State.EXTRACTING) for j in jobs)
+        self.clear_window = win = tk.Toplevel(self.root)
+        win.title("Tout supprimer")
+        win.transient(self.root)
+        win.resizable(False, False)
+        self.theme.decorate(win)
+        card = ttk.Frame(win, style="Card.TFrame", padding=(px(20), px(16), px(20), px(18)))
+        card.pack(fill="both", expand=True, padx=px(16), pady=px(16))
+        ttk.Label(card, text=f"Vider la liste ({plural(len(jobs), 'fichier')}) ?", style="EmptyTitle.TLabel").pack(
+            anchor="w")
+        lines = []
+        if active:
+            lines.append("1 téléchargement en cours ou en attente sera arrêté." if active == 1
+                         else f"{active} téléchargements en cours ou en attente seront arrêtés.")
+        lines.append("Les fichiers terminés et extraits restent sur le disque.")
+        if busy:
+            lines.append(f"{plural(busy, 'fichier')} en cours d'analyse ou d'extraction reste dans la liste.")
+        ttk.Label(card, text="\n".join(lines), style="SurfaceMuted.TLabel", justify="left",
+                  wraplength=px(480)).pack(anchor="w", pady=(px(8), px(12)))
+        partial_var = tk.BooleanVar(value=False)
+        if unfinished:
+            ttk.Checkbutton(card, text="Supprimer aussi les téléchargements inachevés du disque (.part)",
+                            variable=partial_var, style="Switch.TCheckbutton").pack(anchor="w", pady=(0, px(16)))
+        buttons = ttk.Frame(card, style="Surface.TFrame")
+        buttons.pack(anchor="e")
+
+        def confirm(_event=None):
+            win.destroy()
+            self._clear_all(delete_partials=partial_var.get())
+
+        ttk.Button(buttons, text="Annuler", command=win.destroy).pack(side="left")
+        ttk.Button(buttons, text="Tout supprimer", style="Accent.TButton", command=confirm).pack(
+            side="left", padx=(px(8), 0))
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Return>", confirm)
+        win.focus_set()
+
+    def _clear_all(self, delete_partials=False):
+        jobs = [j for j in self.jobs.values() if j.state not in (State.CHECKING, State.EXTRACTING)]
+        if delete_partials:
+            for job in jobs:
+                if job.state in ACTIVE:
+                    self.engine.pause(job, discard=True)  # supprimé par le moteur une fois arrêté
+                elif job.path and job.state not in ON_DISK:
+                    remove_partial(job.path)
+        self._remove(jobs)
+        self._save_queue()
+        self._status(f"Liste vidée ({plural(len(jobs), 'fichier retiré', 'fichiers retirés')}"
+                     + (", téléchargements inachevés supprimés du disque)." if delete_partials else ")."), "ok")
 
     # --- analyse VirusTotal puis extraction ---
 

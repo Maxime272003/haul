@@ -1,39 +1,47 @@
 """Serveur HTTP local (127.0.0.1) qui fait le lien avec le userscript du navigateur.
 
 - GET  /haul.user.js : sert le userscript (installation en un clic dans Violentmonkey/Tampermonkey)
+- GET  /token        : jeton secret de l'installation, lu par le userscript au moment de l'utiliser
 - POST /wanted       : la page a-t-elle été ouverte par l'app ? (le script clique alors DOWNLOAD)
 - POST /found        : lien direct récupéré par le script
 
-Protections : le userscript servi contient un jeton secret propre à l'installation, exigé sur chaque
-POST (en-tête X-Haul-Token). Un site web ne peut donc pas injecter de lien, même depuis une iframe
-« sandbox » (Origin: null). L'en-tête Host est vérifié (contre le DNS rebinding) et le script n'est
-pas servi à une balise <script> d'une page tierce, qui pourrait sinon en lire le jeton.
+Protections : chaque POST doit porter le jeton secret de l'installation (en-tête X-Haul-Token). Un
+site web ne peut donc pas injecter de lien, même depuis une iframe « sandbox » (Origin: null) : il
+ne peut pas lire /token, servi sans en-tête CORS et refusé à toute origine autre qu'une extension,
+à une balise <script> ou à une iframe. Le userscript, lui, passe par GM_xmlhttpRequest (extension,
+pas de CORS). L'en-tête Host est vérifié partout (contre le DNS rebinding).
+
+Le jeton n'est pas écrit dans le script : il n'y a jamais besoin de réinstaller le script quand il change.
 """
 
 import hmac
 import json
+import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .links import DL_RE, is_page_url
 from .paths import USERSCRIPT_PATH
 
+log = logging.getLogger(__name__)
+
 PORT = 17655
 USERSCRIPT_URL = f"http://127.0.0.1:{PORT}/haul.user.js"
-TOKEN_PLACEHOLDER = "__HAUL_TOKEN__"
 MAX_BODY = 16 << 10
 
-# Le userscript passe par son extension (moz-/chrome-extension://) ou par la page fuckingfast.co ;
-# toute autre origine est un site web tiers qui n'a rien à faire ici.
-ALLOWED_ORIGINS = ("chrome-extension://", "moz-extension://", "https://fuckingfast.co", "https://www.fuckingfast.co")
+EXTENSION_ORIGINS = ("chrome-extension://", "moz-extension://", "safari-web-extension://")
+# Le userscript passe par son extension ou par la page fuckingfast.co ; toute autre origine est un
+# site web tiers qui n'a rien à faire ici.
+ALLOWED_ORIGINS = (*EXTENSION_ORIGINS, "https://fuckingfast.co", "https://www.fuckingfast.co")
 
 
 class LinkServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, engine, token, port=PORT, on_bad_token=lambda: None):
+    def __init__(self, engine, token, port=PORT, on_bad_token=lambda kind: None):
         self.engine = engine
         self.token = token
-        self.on_bad_token = on_bad_token  # userscript installé avant l'ajout du jeton
+        # kind : « missing » (ancien script, sans jeton) ou « wrong » (jeton écrit dans un script 3.1)
+        self.on_bad_token = on_bad_token
         super().__init__(("127.0.0.1", port), LinkHandler)
 
 
@@ -46,6 +54,7 @@ class LinkHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -59,21 +68,27 @@ class LinkHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._host_ok():
             return self._reply(403)
-        if self.path != "/haul.user.js":
-            return self._reply(404)
-        # Navigation (installation) ou requête de l'extension : oui. <script>, <iframe>… : non.
-        if self.headers.get("Sec-Fetch-Dest", "document") not in ("document", "empty"):
-            return self._reply(403)
-        script = USERSCRIPT_PATH.read_text(encoding="utf-8").replace(TOKEN_PLACEHOLDER, self.server.token)
-        self._reply(200, script.encode(), "text/javascript; charset=utf-8")
+        if self.path == "/haul.user.js":
+            return self._reply(200, USERSCRIPT_PATH.read_bytes(), "text/javascript; charset=utf-8")
+        if self.path == "/token":
+            origin = self.headers.get("Origin", "")
+            if ((origin and not origin.startswith(EXTENSION_ORIGINS))
+                    or self.headers.get("Sec-Fetch-Dest", "empty") != "empty"):
+                return self._reply(403)
+            return self._json({"token": self.server.token})
+        self._reply(404)
 
     def do_POST(self):
         origin = self.headers.get("Origin", "")
         if (not self._host_ok() or self.path not in ("/found", "/wanted")
                 or (origin and origin != "null" and not origin.startswith(ALLOWED_ORIGINS))):
             return self._reply(403)
-        if not hmac.compare_digest(self.headers.get("X-Haul-Token", "").encode(), self.server.token.encode()):
-            self.server.on_bad_token()
+        sent = self.headers.get("X-Haul-Token", "")
+        if not hmac.compare_digest(sent.encode(), self.server.token.encode()):
+            kind = "wrong" if sent else "missing"
+            log.warning("Requête %s refusée : jeton %s (Origin %r, User-Agent %r)", self.path,
+                        "périmé" if sent else "absent", origin, self.headers.get("User-Agent", "")[:120])
+            self.server.on_bad_token(kind)
             return self._reply(401)
         try:
             length = int(self.headers.get("Content-Length", 0))

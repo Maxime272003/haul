@@ -99,6 +99,17 @@ def error_detail(e):
     return f"Erreur : {str(e).splitlines()[0][:120] if str(e) else type(e).__name__}"
 
 
+def remove_partial(path):
+    """Supprime le téléchargement inachevé de `path` (.part et état de reprise .part.json)."""
+    for suffix in (".part", ".part.json"):
+        try:
+            os.remove(path + suffix)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning("Impossible de supprimer %s", path + suffix, exc_info=True)
+
+
 def complete_on_disk(path, total):
     """Le fichier existe et a la taille attendue (si on la connaît)."""
     try:
@@ -147,6 +158,7 @@ class Engine:
         self._downloaders = {}  # job.id -> Downloader en cours
         self._paths = set()  # fichiers en cours d'écriture
         self._paused = set()  # job.id mis en pause
+        self._discard = set()  # job.id dont le fichier partiel est à supprimer à l'arrêt
         threading.Thread(target=self._resolver, daemon=True).start()
 
     # --- API (thread de l'interface / serveur local) ---
@@ -156,10 +168,12 @@ class Engine:
         if job.dl_url:
             with self._lock:
                 self._paused.discard(job.id)
+                self._discard.discard(job.id)
             self._queue_download(job)
             return
         with self._lock:
             self._paused.discard(job.id)
+            self._discard.discard(job.id)
             queued = job.id in self._resolve_ids  # encore dans la file : il suffit de lever la pause
             self._resolve_ids.add(job.id)
             # publié sous le verrou : _resolve ne peut pas publier BROWSER avant
@@ -167,14 +181,17 @@ class Engine:
         if not queued:
             self._to_resolve.put(job)
 
-    def pause(self, job):
+    def pause(self, job, discard=False):
         """Met le fichier en pause ; l'état PAUSED est publié une fois tout arrêté.
 
         Un fichier dans le navigateur est libéré : la page suivante s'ouvre (« passer ce lien »).
-        Le fichier partiel reste sur le disque, la reprise repart de là.
+        Le fichier partiel reste sur le disque, la reprise repart de là ; avec discard, il est
+        supprimé une fois le téléchargement arrêté (fichiers fermés, état de reprise écrit).
         """
         with self._lock:
             self._paused.add(job.id)
+            if discard:
+                self._discard.add(job.id)
             downloader = self._downloaders.get(job.id)
             entry = self._waiting.get(page_key(job.url))
             browser = entry is not None and entry[0] is job
@@ -361,6 +378,13 @@ class Engine:
             self.set_state(job, State.DOWNLOADING, f"Téléchargement ({conns} connexion{'s' if conns > 1 else ''})",
                            name=name, total=d.total)
             d.download(final, Progress(self.emit, job).update)
+        except Cancelled:
+            with self._lock:
+                discard = job.id in self._discard
+                self._discard.discard(job.id)
+            if discard:
+                remove_partial(final)
+            raise
         finally:
             with self._lock:
                 self._paths.discard(final)

@@ -6,6 +6,10 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), ver
 ## [Non publié]
 
 ### Corrigé
+- Plus besoin de réinstaller le userscript : la version 3.2 ne contient plus le jeton, elle le
+  demande à Haul (`/token`, lisible seulement par l'extension) et le redemande s'il a changé. Une
+  requête refusée indique maintenant si c'est une ancienne copie du script (sans jeton) qui tourne
+  encore dans un navigateur, ou un script 3.1 à mettre à jour une dernière fois.
 - « Retirer les terminés » empêchait d'ajouter de nouveau les mêmes liens.
 - Un fichier déjà présent mais tronqué était considéré comme terminé : sa taille est maintenant
   comparée à celle annoncée par le serveur.
@@ -50,6 +54,9 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), ver
   lien* pour une page qui attend un captcha ; *Rouvrir la page*.
 - *Tout suspendre / Tout reprendre* : met toute la liste en pause ; tant que Haul est suspendu,
   les liens ajoutés arrivent en pause au lieu d'ouvrir des pages.
+- *Tout supprimer* : vide la liste après confirmation (les téléchargements en cours sont arrêtés,
+  les fichiers terminés restent sur le disque) ; option pour supprimer aussi les téléchargements
+  inachevés (`.part` et état de reprise, effacés une fois le téléchargement arrêté).
 - `scripts/bench.py` : mesure le débit de chaque combinaison fichiers simultanés × connexions
   par fichier avec le vrai téléchargeur (voir README, *Mesurer le débit*).
 - Liste des téléchargements sauvegardée (`%APPDATA%\Haul\queue.json`) et retrouvée au lancement

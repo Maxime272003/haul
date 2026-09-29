@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Haul — FuckingFast
 // @namespace    haul.local
-// @version      3.1
+// @version      3.2
 // @description  Envoie le lien de téléchargement FuckingFast à l'app Haul, qui télécharge hors du navigateur.
 // @match        https://fuckingfast.co/*
 // @match        https://www.fuckingfast.co/*
@@ -18,11 +18,10 @@
   "use strict";
 
   const APP = "http://127.0.0.1:17655";
-  // Secret propre à ton installation de Haul, inséré quand l'app sert ce script : sans lui, Haul
-  // refuse la requête. Réinstalle le script depuis l'app (bouton « Installer le script navigateur »)
-  // si Haul affiche « script navigateur à mettre à jour ».
-  const TOKEN = "__HAUL_TOKEN__";
-  const OUTDATED = "Script Haul à mettre à jour : clique « Installer le script navigateur » dans l'app";
+  // Secret propre à ton installation de Haul, exigé sur chaque requête. Il n'est pas écrit dans ce
+  // script : on le demande à Haul (seule une extension peut lire la réponse), et on le redemande si
+  // Haul le refuse. Rien à réinstaller quand il change.
+  let token = null;
   const DIRECT_RE = /^https?:\/\/(?:dl\.fuckingfast\.co\/|(?:www\.)?fuckingfast\.co\/dl\/)/i;
   const LEGACY_RE = /window\.open\("(https?:\/\/(?:www\.)?fuckingfast\.co\/dl\/[^"]+)"\)/;
 
@@ -43,12 +42,12 @@
     el.textContent = text;
   }
 
-  function api(path, body, onload, onerror) {
+  function request(method, path, body, headers, onload, onerror) {
     GM_xmlhttpRequest({
-      method: "POST",
+      method,
       url: APP + path,
-      headers: { "Content-Type": "application/json", "X-Haul-Token": TOKEN },
-      data: JSON.stringify(body),
+      headers,
+      data: body === null ? undefined : JSON.stringify(body),
       timeout: 5000,
       onload(r) {
         if (r.status !== 200) return onerror(r.status);
@@ -57,6 +56,22 @@
       onerror() { onerror(0); },
       ontimeout() { onerror(0); },
     });
+  }
+
+  function withToken(then, onerror) {
+    if (token) return then(token);
+    request("GET", "/token", null, {}, (res) => { token = res.token; then(token); }, onerror);
+  }
+
+  function api(path, body, onload, onerror, retried) {
+    withToken((t) => request("POST", path, body, { "Content-Type": "application/json", "X-Haul-Token": t },
+      onload, (code) => {
+        if (code === 401 && !retried) {  // jeton changé côté Haul : on le redemande une fois
+          token = null;
+          return api(path, body, onload, onerror, true);
+        }
+        onerror(code);
+      }), onerror);
   }
 
   // fallback : appelé si l'app ne prend pas le lien (téléchargement normal dans le navigateur)
@@ -70,8 +85,7 @@
       if (res.close) setTimeout(() => window.close(), 800);
     }, (code) => {
       state = "idle";
-      banner(code === 401 ? OUTDATED
-        : code ? "Haul a refusé le lien (" + code + ")" : "Haul n'est pas lancé : téléchargement dans le navigateur",
+      banner(code ? "Haul a refusé le lien (" + code + ")" : "Haul n'est pas lancé : téléchargement dans le navigateur",
         "#8a6d00");
       if (fallback) fallback();
     });
@@ -111,5 +125,5 @@
       clearInterval(timer);
       btn.click();
     }, 700);
-  }, (code) => banner(code === 401 ? OUTDATED : "Haul n'est pas lancé", "#8a6d00"));
+  }, (code) => banner(code ? "Haul a refusé la requête (" + code + ")" : "Haul n'est pas lancé", "#8a6d00"));
 })();

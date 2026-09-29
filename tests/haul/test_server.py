@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from haul.server import MAX_BODY, TOKEN_PLACEHOLDER, LinkServer
+from haul.server import MAX_BODY, LinkServer
 
 TOKEN = "t" * 43
 
@@ -24,7 +24,7 @@ class FakeEngine:
 @pytest.fixture
 def server():
     engine, bad = FakeEngine(), []
-    srv = LinkServer(engine, TOKEN, port=0, on_bad_token=lambda: bad.append(1))
+    srv = LinkServer(engine, TOKEN, port=0, on_bad_token=bad.append)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     srv.bad_tokens = bad
     yield srv, engine
@@ -74,14 +74,14 @@ def test_rejects_third_party_origin(server):
     assert engine.found == []
 
 
-@pytest.mark.parametrize("token", [None, "mauvais", TOKEN_PLACEHOLDER])
-def test_rejects_missing_or_wrong_token_even_with_null_origin(server, token):
+@pytest.mark.parametrize(("token", "kind"), [(None, "missing"), ("mauvais", "wrong")])
+def test_rejects_missing_or_wrong_token_even_with_null_origin(server, token, kind):
     # une iframe « sandbox » de n'importe quel site envoie Origin: null
     srv, engine = server
     status, _ = request(srv, "POST", "/found", FOUND, token=token, origin="null")
     assert status == 401
     assert engine.found == []
-    assert srv.bad_tokens == [1]
+    assert srv.bad_tokens == [kind]  # ancien script sans jeton / jeton périmé : message différent
 
 
 def test_page_url_that_is_not_a_fuckingfast_page_is_dropped(server):
@@ -111,16 +111,23 @@ def test_rejects_oversized_body_and_foreign_host(server):
     assert engine.found == []
 
 
-def test_serves_userscript_with_token(server):
+def test_serves_userscript_without_any_secret(server):
+    # le jeton n'est plus écrit dans le script : le réinstaller n'est jamais nécessaire
     srv, _ = server
     status, body = request(srv, "GET", "/haul.user.js", token=None)
     assert status == 200
     assert body.startswith(b"// ==UserScript==")
-    assert TOKEN.encode() in body and TOKEN_PLACEHOLDER.encode() not in body
+    assert TOKEN.encode() not in body
 
 
-def test_userscript_not_served_to_script_tags(server):
-    # <script src=…> dans une page tierce pourrait lire le jeton en remplaçant GM_xmlhttpRequest
+def test_token_is_readable_by_the_extension_only(server):
     srv, _ = server
-    assert request(srv, "GET", "/haul.user.js", token=None, headers={"Sec-Fetch-Dest": "script"})[0] == 403
-    assert request(srv, "GET", "/haul.user.js", token=None, headers={"Sec-Fetch-Dest": "document"})[0] == 200
+    for origin in (None, "chrome-extension://abc", "moz-extension://abc"):
+        status, body = request(srv, "GET", "/token", token=None, origin=origin, headers={"Sec-Fetch-Dest": "empty"})
+        assert (status, json.loads(body)) == (200, {"token": TOKEN})
+    # une page web (même fuckingfast.co), une iframe « sandbox », une balise <script> ou <iframe> : non
+    for origin in ("https://evil.example", "https://fuckingfast.co", "null"):
+        assert request(srv, "GET", "/token", token=None, origin=origin)[0] == 403
+    for dest in ("script", "iframe", "document"):
+        assert request(srv, "GET", "/token", token=None, headers={"Sec-Fetch-Dest": dest})[0] == 403
+    assert request(srv, "GET", "/token", token=None, host="evil.example:17655")[0] == 403
