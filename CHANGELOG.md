@@ -74,6 +74,10 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), ver
 - Clé API VirusTotal chiffrée avec DPAPI ; une ancienne clé en clair est chiffrée à la première lecture.
 
 ### Ajouté
+- Mises à jour automatiques : chaque fusion sur `main` publie une release avec `Haul.exe` ;
+  l'application la trouve (au lancement puis toutes les 6 h), la télécharge en vérifiant son
+  empreinte SHA-256 et l'installe en quittant, ou tout de suite avec *Redémarrer pour mettre à
+  jour*. Réglage *Mises à jour automatiques*.
 - Temps restant par fichier (colonne Vitesse) et pour l'ensemble.
 - Espace disque vérifié avant chaque téléchargement (en comptant ceux en cours) : message clair au
   lieu d'une erreur en plein fichier.

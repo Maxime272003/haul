@@ -1,6 +1,7 @@
 """Point d'entrée : `python -m haul`, commande `haul` ou Haul.exe.
 
-Option --minimized : démarre réduit dans la zone de notification (lancement avec Windows).
+Options : --minimized démarre réduit dans la zone de notification (lancement avec Windows) ;
+--wait-pid N attend la fin de l'ancienne instance (relance après une mise à jour).
 """
 
 import logging
@@ -32,9 +33,18 @@ def setup_logging():
 
 def main():
     setup_logging()
-    from haul import config, desktop
+    from haul import config, desktop, updater
     from haul.server import show_running_instance
 
+    args = sys.argv[1:]
+    if updater.WAIT_PID_ARG in args:
+        try:
+            desktop.wait_process(int(args[args.index(updater.WAIT_PID_ARG) + 1]))
+        except (IndexError, ValueError):
+            pass
+    exe = updater.current_exe()
+    if exe:
+        updater.cleanup(exe)
     instance = desktop.single_instance()
     if not instance:
         # Haul tourne déjà : on l'affiche au lieu d'en lancer un 2e (presse-papier surveillé deux fois,
@@ -55,7 +65,7 @@ def main():
         pass
     from haul.gui import App
     root = tk.Tk()
-    App(root, minimized=desktop.MINIMIZED_ARG in sys.argv[1:])
+    App(root, minimized=desktop.MINIMIZED_ARG in args)
     root.mainloop()
 
 

@@ -10,7 +10,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, clipboard, config, desktop, dialogs, notify, postprocess
+from . import __version__, clipboard, config, desktop, dialogs, notify, postprocess, updater
 from .engine import ACTIVE, NO_SCRIPT, ON_DISK, Engine, Job, State, remove_partial
 from .links import (
     DL_RE,
@@ -38,6 +38,8 @@ SPEED_CHOICES = (0, 1, 2, 5, 10, 20, 50, 100)  # débit total maximal, Mo/s (0 =
 CAPTCHA_ALERT_AFTER = 10  # secondes dans le navigateur sans lien reçu : on prévient
 NOTIFICATION_LIFETIME = 30_000  # ms avant de retirer l'icône de notification
 LINK_MAX_AGE = 24 * 3600  # s pendant lesquelles un lien direct sauvegardé vaut la peine d'être essayé
+UPDATE_FIRST_CHECK = 10_000  # ms après le lancement avant de chercher une mise à jour
+UPDATE_INTERVAL = 6 * 3600 * 1000  # ms entre deux recherches
 
 KINDS = {
     State.WAITING: "wait", State.QUEUED: "wait", State.RETRY: "wait", State.BROWSER: "browser",
@@ -203,6 +205,8 @@ class App:
         self.layout_dirty = True
         self.tray = None
         self.script_seen = None  # version du userscript qui s'est manifesté pendant cette session
+        self.update = None  # {"version", "path"} : nouvelle version téléchargée, installée en quittant
+        self.update_busy = False  # recherche ou téléchargement en cours
         root.report_callback_exception = self._on_tk_error
 
         self.theme = Theme(root, self.cfg["theme"])
@@ -227,6 +231,8 @@ class App:
         self.last_seq = clipboard.sequence()
         self.timers = {"clipboard": root.after(700, self._poll_clipboard),
                        "events": root.after(200, self._drain_events)}
+        if self.cfg["auto_update"]:
+            self.timers["update"] = root.after(UPDATE_FIRST_CHECK, self._check_update)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         try:
             self.server = LinkServer(
@@ -253,7 +259,8 @@ class App:
                         connections=self._spin_value(self.conn_var, 1, 16), max_speed=speed,
                         watch=self.watch_var.get(), scan=self.scan_var.get(), extract=self.extract_var.get(),
                         notify=self.notify_var.get(), subfolders=self.subfolders_var.get(),
-                        delete_archives=self.delete_var.get(), tray=self.tray_var.get())
+                        delete_archives=self.delete_var.get(), tray=self.tray_var.get(),
+                        auto_update=self.update_var.get())
         config.save(self.cfg)
 
     @staticmethod
@@ -277,6 +284,8 @@ class App:
             self.tray.stop()
             self.tray = None
             self._show_window()
+        if self.update_var.get() and not self.timers.get("update"):
+            self._check_update()
         self._postprocess()  # analyse / extraction activée alors que des fichiers attendent
 
     def _autostart_changed(self):
@@ -323,8 +332,11 @@ class App:
         ttk.Label(header, textvariable=self.script_var, style="Muted.TLabel").grid(row=1, column=1, sticky="nw")
         buttons = ttk.Frame(header)
         buttons.grid(row=0, column=2, rowspan=2, sticky="e")
-        ttk.Button(buttons, text="Installer le script navigateur",
-                   command=lambda: os.startfile(USERSCRIPT_URL)).pack(side="left")
+        # affiché quand une nouvelle version est téléchargée (voir _update_ready)
+        self.update_btn = ttk.Button(buttons, style="Accent.TButton", command=lambda: self._on_close(restart=True))
+        self.script_btn = ttk.Button(buttons, text="Installer le script navigateur",
+                                     command=lambda: os.startfile(USERSCRIPT_URL))
+        self.script_btn.pack(side="left")
         ttk.Button(buttons, text="Ajouter des liens…", command=lambda: dialogs.links_dialog(self)).pack(
             side="left", padx=(px(8), 0))
         ttk.Button(buttons, text="Ajouter depuis le presse-papier", style="Accent.TButton",
@@ -362,6 +374,7 @@ class App:
         self.delete_var = tk.BooleanVar(value=self.cfg["delete_archives"])
         self.tray_var = tk.BooleanVar(value=self.cfg["tray"])
         self.autostart_var = tk.BooleanVar(value=desktop.autostart_enabled())
+        self.update_var = tk.BooleanVar(value=self.cfg["auto_update"])
 
         def switch(text, var, command=self._switch_changed):
             return ttk.Checkbutton(opts, text=text, variable=var, style="Switch.TCheckbutton", command=command)
@@ -388,7 +401,8 @@ class App:
                  switch("Archives à la corbeille après extraction", self.delete_var),
                  switch("Notifications", self.notify_var),
                  switch("Icône dans la zone de notification", self.tray_var),
-                 switch("Démarrer avec Windows", self.autostart_var, self._autostart_changed))
+                 switch("Démarrer avec Windows", self.autostart_var, self._autostart_changed),
+                 switch("Mises à jour automatiques", self.update_var))
         return card
 
     def _build_list_header(self, parent):
@@ -627,6 +641,75 @@ class App:
         else:
             self._status("Le script navigateur est en version 3.1 : mets-le à jour une dernière fois (« Installer le "
                          "script navigateur »). À partir de la 3.2, il se synchronise tout seul avec Haul.", "warn")
+
+    # --- mises à jour ---
+
+    def _check_update(self):
+        """Cherche une nouvelle release (dans un thread) ; recommence toutes les UPDATE_INTERVAL ms."""
+        self.timers["update"] = None
+        if not self.update_var.get():
+            return
+        self.timers["update"] = self.root.after(UPDATE_INTERVAL, self._check_update)
+        if self.update_busy:
+            return
+        self.update_busy = True
+
+        def run():
+            try:
+                release = updater.latest_release(__version__)
+            except Exception:
+                log.warning("Recherche de mise à jour impossible", exc_info=True)
+                release = None
+            self.calls.put(lambda: self._update_found(release))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _update_found(self, release):
+        exe = updater.current_exe()
+        if not release or (self.update and self.update["version"] == release["version"]):
+            self.update_busy = False
+            return
+        if not exe:  # lancé depuis les sources : rien à remplacer
+            self.update_busy = False
+            self._status(f"Haul {release['version']} est disponible : {release['page']}")
+            return
+        log.info("Mise à jour %s : téléchargement", release["version"])
+
+        def run():
+            try:
+                path = updater.download(release, __version__, exe)
+            except Exception as e:
+                log.warning("Téléchargement de la mise à jour impossible", exc_info=True)
+                self.calls.put(lambda error=e: self._update_failed(release, error))  # e effacé après except
+                return
+            self.calls.put(lambda: self._update_ready(release, path))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _update_failed(self, release, error):
+        self.update_busy = False
+        self._status(f"Mise à jour {release['version']} non téléchargée ({error}) : nouvel essai plus tard, ou "
+                     f"télécharge-la sur {release['page']}", "warn")
+
+    def _update_ready(self, release, path):
+        self.update_busy = False
+        self.update = {"version": release["version"], "path": path}
+        self.update_btn.configure(text=f"Redémarrer pour mettre à jour ({release['version']})")
+        self.update_btn.pack(side="left", padx=(0, self.theme.px(8)), before=self.script_btn)
+        self._status(f"Haul {release['version']} est prêt : il s'installera quand tu quitteras Haul, ou tout de "
+                     "suite avec « Redémarrer pour mettre à jour ».", "ok")
+        self._alert("Mise à jour prête", f"Haul {release['version']} s'installera à la fermeture.")
+
+    def _install_update(self, restart):
+        """En quittant : remplace Haul.exe par la version téléchargée, et la lance si demandé."""
+        exe = updater.current_exe()
+        if not self.update or not exe:
+            return
+        try:
+            updater.install(self.update["path"], exe)
+            log.info("Mise à jour %s installée", self.update["version"])
+            if restart:
+                updater.relaunch(exe)
+        except OSError:
+            log.exception("Installation de la mise à jour impossible")
 
     # --- fenêtre, zone de notification, notifications ---
 
@@ -1265,7 +1348,8 @@ class App:
     def _api_key_dialog(self):
         dialogs.api_key_dialog(self)
 
-    def _on_close(self):
+    def _on_close(self, restart=False):
+        """Quitte Haul (en installant une mise à jour téléchargée ; restart : puis relance Haul)."""
         active = [j for j in self.jobs.values() if j.state in ACTIVE]
         if active or self.busy:
             lines = []
@@ -1274,7 +1358,9 @@ class App:
                              "ils seront mis en pause et pourront reprendre au prochain lancement.")
             if self.busy:
                 lines.append("L'analyse ou l'extraction en cours sera interrompue.")
-            if not messagebox.askyesno("Quitter Haul ?", "\n\n".join(lines) + "\n\nQuitter Haul ?",
+            question = "Redémarrer Haul pour le mettre à jour ?" if restart else "Quitter Haul ?"
+            if not messagebox.askyesno("Mettre à jour Haul ?" if restart else "Quitter Haul ?",
+                                       "\n\n".join(lines) + "\n\n" + question,
                                        icon="warning", default="no", parent=self.root):
                 return
         self._save_config()
@@ -1289,4 +1375,5 @@ class App:
         for timer in (*self.timers.values(), self.notification_timer):
             if timer:
                 self.root.after_cancel(timer)
+        self._install_update(restart)
         self.root.destroy()

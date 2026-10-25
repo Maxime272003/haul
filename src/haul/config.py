@@ -20,6 +20,7 @@ DEFAULTS = {
     "subfolders": True,  # un sous-dossier par jeu (nom de l'archive) dans le dossier de destination
     "delete_archives": False,  # archives envoyées à la corbeille après une extraction réussie
     "tray": True,        # icône dans la zone de notification ; réduire y range la fenêtre
+    "auto_update": True,  # chercher, télécharger et installer (en quittant) les nouvelles versions
     "script_version": "",  # dernière version du userscript qui s'est manifestée ("?" : avant la 3.3)
 }
 
