@@ -4,6 +4,7 @@
 - GET  /token        : jeton secret de l'installation, lu par le userscript au moment de l'utiliser
 - POST /wanted       : la page a-t-elle été ouverte par l'app ? (le script clique alors DOWNLOAD)
 - POST /found        : lien direct récupéré par le script
+- POST /show         : un 2e lancement de Haul demande à cette instance de s'afficher
 
 Protections : chaque POST doit porter le jeton secret de l'installation (en-tête X-Haul-Token). Un
 site web ne peut donc pas injecter de lien, même depuis une iframe « sandbox » (Origin: null) : il
@@ -17,6 +18,7 @@ Le jeton n'est pas écrit dans le script : il n'y a jamais besoin de réinstalle
 import hmac
 import json
 import logging
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .links import DL_RE, is_page_url
@@ -37,11 +39,14 @@ ALLOWED_ORIGINS = (*EXTENSION_ORIGINS, "https://fuckingfast.co", "https://www.fu
 class LinkServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, engine, token, port=PORT, on_bad_token=lambda kind: None):
+    def __init__(self, engine, token, port=PORT, on_bad_token=lambda kind: None, on_script=lambda version: None,
+                 on_show=lambda: None):
         self.engine = engine
         self.token = token
         # kind : « missing » (ancien script, sans jeton) ou « wrong » (jeton écrit dans un script 3.1)
         self.on_bad_token = on_bad_token
+        self.on_script = on_script  # le userscript s'est manifesté (version, ou "" avant la 3.3)
+        self.on_show = on_show
         super().__init__(("127.0.0.1", port), LinkHandler)
 
 
@@ -80,7 +85,7 @@ class LinkHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         origin = self.headers.get("Origin", "")
-        if (not self._host_ok() or self.path not in ("/found", "/wanted")
+        if (not self._host_ok() or self.path not in ("/found", "/wanted", "/show")
                 or (origin and origin != "null" and not origin.startswith(ALLOWED_ORIGINS))):
             return self._reply(403)
         sent = self.headers.get("X-Haul-Token", "")
@@ -90,6 +95,13 @@ class LinkHandler(BaseHTTPRequestHandler):
                         "périmé" if sent else "absent", origin, self.headers.get("User-Agent", "")[:120])
             self.server.on_bad_token(kind)
             return self._reply(401)
+        if self.path == "/show":
+            if origin:  # seulement un autre lancement de Haul, jamais le navigateur
+                return self._reply(403)
+            self.server.on_show()
+            return self._json({"ok": True})
+        version = self.headers.get("X-Haul-Script", "")
+        self.server.on_script(version if len(version) <= 16 and version.replace(".", "").isdigit() else "")
         try:
             length = int(self.headers.get("Content-Length", 0))
             if not 0 <= length <= MAX_BODY:
@@ -99,7 +111,7 @@ class LinkHandler(BaseHTTPRequestHandler):
             if not is_page_url(page_url):
                 page_url = ""  # jamais ouvert ni affiché : seul le lien direct compte
             if self.path == "/wanted":
-                return self._json({"wanted": bool(page_url) and self.server.engine.is_waiting(page_url)})
+                return self._json({"wanted": bool(page_url) and self.server.engine.page_checked(page_url)})
             dl_url = data["dl_url"]
             if not isinstance(dl_url, str) or not DL_RE.fullmatch(dl_url):
                 raise ValueError(dl_url)
@@ -110,3 +122,26 @@ class LinkHandler(BaseHTTPRequestHandler):
             return self._reply(400)
         close = self.server.engine.link_found(page_url, dl_url, user_agent)
         self._json({"ok": True, "close": close})
+
+
+def bundled_script_version(path=USERSCRIPT_PATH):
+    """Version du userscript livré avec cette version de Haul (ligne @version)."""
+    try:
+        m = re.search(r"^// @version\s+(\S+)", path.read_text(encoding="utf-8"), re.M)
+    except OSError:
+        return ""
+    return m.group(1) if m else ""
+
+
+def show_running_instance(token, port=PORT, timeout=3):
+    """Demande à l'instance déjà lancée de s'afficher ; True si elle a répondu."""
+    import http.client
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        try:
+            conn.request("POST", "/show", b"{}", {"Content-Type": "application/json", "X-Haul-Token": token})
+            return conn.getresponse().status == 200
+        finally:
+            conn.close()
+    except OSError:
+        return False

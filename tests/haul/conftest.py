@@ -20,6 +20,7 @@ class FileServer(ThreadingHTTPServer):
         self.wrong_range = wrong_range  # ignore le début demandé (hors sonde) : réponse à ne pas écrire
         self.active = 0
         self.peak = 0
+        self.ranges_asked = []  # plages demandées (hors sonde)
         self.lock = threading.Lock()
         super().__init__(("127.0.0.1", 0), _Handler)
 
@@ -52,6 +53,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             srv.active += 1
             srv.peak = max(srv.peak, srv.active)
+            if self.headers.get("Range", "bytes=0-0") != "bytes=0-0":
+                srv.ranges_asked.append(self.headers["Range"])
         try:
             m = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range", "")) if srv.ranges else None
             a, b = 0, len(srv.data) - 1

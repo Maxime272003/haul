@@ -6,6 +6,16 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), ver
 ## [Non publié]
 
 ### Corrigé
+- Un fichier du même nom déjà présent dans le dossier était considéré comme téléchargé tant que
+  sa taille n'était pas connue (lien tout juste ajouté), même tronqué ou d'une autre version : il
+  est maintenant comparé à la taille annoncée par le serveur.
+- Lancer Haul une deuxième fois ouvrait des pages sans pouvoir recevoir leurs liens (erreur au bout
+  de 10 min) : la fenêtre déjà ouverte est maintenant affichée à la place.
+- L'extraction pouvait écraser un dossier existant du même nom (version précédente du jeu, avec ses
+  sauvegardes) : rien n'est plus jamais écrasé, un nom pris reçoit un suffixe « (2) ».
+- Les erreurs de l'interface et des threads n'étaient écrites nulle part avec `Haul.exe` (pas de
+  console) : elles vont dans `haul.log`, qui ne grossit plus sans fin (3 fichiers de 5 Mo).
+- Noms de fichiers réservés par Windows (`CON`, `NUL`, `COM1`…) renommés.
 - Plus besoin de réinstaller le userscript : la version 3.2 ne contient plus le jeton, elle le
   demande à Haul (`/token`, lisible seulement par l'extension) et le redemande s'il a changé. Une
   requête refusée indique maintenant si c'est une ancienne copie du script (sans jeton) qui tourne
@@ -23,6 +33,18 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), ver
   simultanés est ramené à ce que le serveur accepte, jusqu'à ce qu'un téléchargement se termine.
 
 ### Modifié
+- Extraction par UnRAR, sans fenêtre, dans un dossier temporaire renommé à la fin : les volumes ne
+  sont lus qu'une fois (le test d'intégrité séparé disparaît, les CRC sont vérifiés pendant
+  l'extraction), un échec ne laisse rien. Avancement en pourcentage dans la liste.
+- Chaque jeu est analysé et extrait dès que tous ses volumes sont téléchargés, sans attendre le
+  reste de la liste.
+- Fin de téléchargement plus rapide : une connexion libre prend la moitié du plus gros segment
+  restant au lieu d'attendre les autres.
+- Le débit max s'applique en une seconde, même au milieu d'un gros segment.
+- Vitesse affichée lissée.
+- Userscript 3.3 (mise à jour automatique) : envoie sa version à Haul.
+- Code : fenêtres secondaires dans `dialogs.py`, enchaînement analyse / extraction dans
+  `postprocess.process` (testé sans interface).
 - Écriture des téléchargements bufferisée (un fichier ouvert par connexion, tampon de 1 Mo),
   compteurs de progression sans verrou.
 - États des fichiers typés (`State`) au lieu de libellés comparés comme du texte.
@@ -34,6 +56,9 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), ver
   étroite, le message d'état aussi, les colonnes sont dimensionnées d'après leur contenu.
 
 ### Sécurité
+- Extraction refusée si l'archive contient un lien (symbolique, jonction, lien dur) ou si le disque
+  n'a pas la place pour son contenu.
+- Si le port 17655 est occupé par un autre programme, Haul indique lequel.
 - Serveur local protégé par un jeton secret propre à l'installation (en-tête `X-Haul-Token`,
   inséré dans le userscript servi) : un site web ne peut plus injecter de lien, même depuis une
   iframe *sandbox* (`Origin: null`). **Le userscript doit être réinstallé** (version 3.1, qui se
@@ -49,6 +74,23 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), ver
 - Clé API VirusTotal chiffrée avec DPAPI ; une ancienne clé en clair est chiffrée à la première lecture.
 
 ### Ajouté
+- Temps restant par fichier (colonne Vitesse) et pour l'ensemble.
+- Espace disque vérifié avant chaque téléchargement (en comptant ceux en cours) : message clair au
+  lieu d'une erreur en plein fichier.
+- Nouvel essai automatique après une erreur réseau (1, 5 puis 15 min, état « Nouvel essai
+  bientôt ») ; un lien direct expiré rouvre sa page une fois.
+- Le lien direct est gardé dans la liste sauvegardée : la reprise au lancement suivant ne rouvre
+  la page que s'il a expiré.
+- Indicateur du script navigateur sous le titre (version, actif) ; avertissement quand une page
+  ouverte n'a aucune nouvelle du script au bout de 20 s.
+- Réglage *Un dossier par jeu* : chaque jeu dans un sous-dossier à son nom, bonus compris.
+- Réglage *Archives à la corbeille après extraction*.
+- Icône dans la zone de notification (afficher, tout suspendre, ouvrir le dossier, quitter) ;
+  réduire la fenêtre l'y range. Réglage *Démarrer avec Windows* (réduit).
+- Liste : volumes d'un même jeu regroupés sous une ligne repliable, tri par colonne, champ
+  *Filtrer* (Ctrl+F), *Placer en tête / en fin de file* (Alt+↑ / Alt+↓).
+- *Ajouter des liens…* (coller ou importer un fichier) et dépôt de fichiers `.html` / `.txt` /
+  `.url` sur la fenêtre.
 - Pause / reprise par fichier : bouton *Mettre en pause / Reprendre* pour la sélection
   (<kbd>Ctrl</kbd>+<kbd>A</kbd> pour tout sélectionner), menu contextuel, touche Espace ; *Passer ce
   lien* pour une page qui attend un captcha ; *Rouvrir la page*.

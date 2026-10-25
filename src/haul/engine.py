@@ -7,20 +7,26 @@ fichier est téléchargé hors navigateur, plusieurs fichiers en parallèle.
 
 import logging
 import os
-import queue
+import shutil
 import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
 from enum import Enum
 
-from .downloader import Cancelled, Downloader, Refused
-from .links import is_page_url, page_key, safe_name
+from .downloader import NETWORK_ERRORS, Cancelled, Downloader, Refused
+from .links import duration, human_size, is_page_url, page_key, safe_name
 
 log = logging.getLogger(__name__)
 
 LINK_TIMEOUT = 600  # temps laissé pour valider le captcha dans le navigateur
+SCRIPT_TIMEOUT = 20  # sans nouvelles du userscript passé ce délai, on prévient
 MIN_CONNECTION_SPEED = 16 << 10  # plancher par connexion quand le débit total est limité
+RETRY_DELAYS = (60, 300, 900)  # s avant chaque nouvel essai automatique après une erreur réseau
+DISK_MARGIN = 256 << 20  # espace laissé libre sur le disque en plus des téléchargements
+SPEED_SMOOTHING = 0.3  # poids de la dernière mesure dans la vitesse affichée (moyenne mobile)
+NO_SCRIPT = ("Dans le navigateur : le script Haul ne répond pas (installé dans ce navigateur ? "
+             "« Installer le script navigateur »)")
 
 
 class State(str, Enum):
@@ -29,6 +35,7 @@ class State(str, Enum):
     WAITING = "waiting"          # en file, page pas encore ouverte
     BROWSER = "browser"          # page ouverte, en attente du lien direct (captcha)
     QUEUED = "queued"            # lien direct reçu, en attente d'une place de téléchargement
+    RETRY = "retry"              # erreur réseau : nouvel essai automatique programmé
     CONNECTING = "connecting"
     DOWNLOADING = "downloading"
     PAUSED = "paused"
@@ -46,6 +53,7 @@ LABELS = {
     State.WAITING: "En attente",
     State.BROWSER: "Dans le navigateur : valide le captcha si demandé",
     State.QUEUED: "En attente de téléchargement",
+    State.RETRY: "Nouvel essai bientôt",
     State.CONNECTING: "Connexion au serveur…",
     State.DOWNLOADING: "Téléchargement",
     State.PAUSED: "En pause",
@@ -63,7 +71,8 @@ LABELS = {
 ON_DISK = frozenset({State.DONE, State.PRESENT, State.CHECKING, State.EXTRACTING, State.EXTRACTED,
                      State.EXTRACT_FAILED, State.BLOCKED})
 # Encore entre les mains du moteur
-ACTIVE = frozenset({State.WAITING, State.BROWSER, State.QUEUED, State.CONNECTING, State.DOWNLOADING})
+ACTIVE = frozenset({State.WAITING, State.BROWSER, State.QUEUED, State.RETRY, State.CONNECTING,
+                    State.DOWNLOADING})
 
 
 @dataclass(eq=False)  # comparé par identité (listes d'attente du moteur)
@@ -95,6 +104,14 @@ class ServerBusy(Exception):
     """Le serveur refuse une connexion de plus (429/503) même après attente."""
 
 
+class LinkExpired(Exception):
+    """Le serveur ne sert plus le fichier sur ce lien direct (sans doute expiré)."""
+
+
+class DiskFull(Exception):
+    """Pas assez de place sur le disque pour finir le téléchargement."""
+
+
 def error_detail(e):
     return f"Erreur : {str(e).splitlines()[0][:120] if str(e) else type(e).__name__}"
 
@@ -124,14 +141,16 @@ class Progress:
     def __init__(self, emit, job, start=0):
         self.emit, self.job = emit, job
         self.t_last, self.b_last = time.monotonic(), start
+        self.speed = None  # lissée : le temps restant affiché ne saute pas d'une mesure à l'autre
 
     def update(self, done, total=None, force=False):
         now = time.monotonic()
         if not force and now - self.t_last < 0.5:
             return
         speed = (done - self.b_last) / max(now - self.t_last, 1e-6)
+        self.speed = speed if self.speed is None else SPEED_SMOOTHING * speed + (1 - SPEED_SMOOTHING) * self.speed
         self.t_last, self.b_last = now, done
-        self.emit(self.job, done=done, total=total, speed=speed)
+        self.emit(self.job, done=done, total=total, speed=self.speed)
 
 
 class Engine:
@@ -149,22 +168,35 @@ class Engine:
         self.connections = 8
         self.max_speed = 0  # octets/s, tous téléchargements confondus (0 = illimité)
         self._lock = threading.Lock()
-        self._to_resolve = queue.Queue()
-        self._resolve_ids = set()  # jobs dans _to_resolve (pas de doublon après pause / reprise)
+        self._resolve_ready = threading.Condition(self._lock)
+        self._to_resolve = []  # pages à ouvrir, dans l'ordre (réordonnable : priorité)
         self._waiting = {}  # page_key -> (job, threading.Event)
+        self._checked = set()  # page_key des pages ouvertes où le userscript s'est manifesté
         self._dl_pending = []
         self._dl_active = 0
         self._busy_cap = None  # fichiers simultanés acceptés par le serveur (429 au-delà), jusqu'à une fin
         self._downloaders = {}  # job.id -> Downloader en cours
-        self._paths = set()  # fichiers en cours d'écriture
+        self._paths = {}  # fichier en cours d'écriture -> job.id
         self._paused = set()  # job.id mis en pause
         self._discard = set()  # job.id dont le fichier partiel est à supprimer à l'arrêt
+        self._retries = {}  # job.id -> nouveaux essais automatiques déjà faits
+        self._retry_timers = {}  # job.id -> threading.Timer du prochain essai
+        self._reopened = set()  # job.id dont la page a été rouverte après un lien expiré
         threading.Thread(target=self._resolver, daemon=True).start()
 
     # --- API (thread de l'interface / serveur local) ---
 
     def submit(self, job):
-        """Ajoute le fichier à la file, ou le reprend après une pause ou une erreur."""
+        """Ajoute le fichier à la file, ou le reprend après une pause ou une erreur (essais remis à zéro)."""
+        with self._lock:
+            self._retries.pop(job.id, None)
+            self._reopened.discard(job.id)
+            timer = self._retry_timers.pop(job.id, None)
+        if timer:
+            timer.cancel()
+        self._start(job)
+
+    def _start(self, job):
         if job.dl_url:
             with self._lock:
                 self._paused.discard(job.id)
@@ -174,12 +206,11 @@ class Engine:
         with self._lock:
             self._paused.discard(job.id)
             self._discard.discard(job.id)
-            queued = job.id in self._resolve_ids  # encore dans la file : il suffit de lever la pause
-            self._resolve_ids.add(job.id)
-            # publié sous le verrou : _resolve ne peut pas publier BROWSER avant
+            # publié sous le verrou : _resolver ne peut pas publier BROWSER avant
             self.set_state(job, State.WAITING)
-        if not queued:
-            self._to_resolve.put(job)
+            if job not in self._to_resolve:  # encore dans la file : il suffit de lever la pause
+                self._to_resolve.append(job)
+                self._resolve_ready.notify()
 
     def pause(self, job, discard=False):
         """Met le fichier en pause ; l'état PAUSED est publié une fois tout arrêté.
@@ -195,15 +226,29 @@ class Engine:
             downloader = self._downloaders.get(job.id)
             entry = self._waiting.get(page_key(job.url))
             browser = entry is not None and entry[0] is job
-            pending = job in self._dl_pending
-            if pending:
-                self._dl_pending.remove(job)
+            pending = False
+            for waiting in (self._dl_pending, self._to_resolve):
+                if job in waiting:
+                    waiting.remove(job)
+                    pending = True
+            timer = self._retry_timers.pop(job.id, None)
+        if timer:
+            timer.cancel()
         if downloader:
             downloader.cancel()  # _run_download publie PAUSED
         elif browser:
             entry[1].set()  # _resolver publie PAUSED
-        elif pending or job.id in self._resolve_ids:
-            self.set_state(job, State.PAUSED, speed=0)
+        elif pending or timer:
+            self.set_state(job, State.PAUSED, speed=0, detail="")
+
+    def prioritize(self, jobs, first=True):
+        """Place ces fichiers en tête (ou en fin) des pages à ouvrir et des téléchargements en attente."""
+        ids = {j.id for j in jobs}
+        with self._lock:
+            for waiting in (self._to_resolve, self._dl_pending):
+                moved = [j for j in waiting if j.id in ids]
+                rest = [j for j in waiting if j.id not in ids]
+                waiting[:] = moved + rest if first else rest + moved
 
     def set_parallel(self, n):
         self.max_parallel = n
@@ -218,6 +263,19 @@ class Engine:
     def is_waiting(self, page_url):
         with self._lock:
             return page_key(page_url) in self._waiting
+
+    def page_checked(self, page_url):
+        """Le userscript demande si la page est attendue : il est donc bien installé et actif."""
+        key = page_key(page_url)
+        with self._lock:
+            entry = self._waiting.get(key)
+            if not entry:
+                return False
+            warned = key not in self._checked and entry[0].detail == NO_SCRIPT
+            self._checked.add(key)
+        if warned:
+            self.set_state(entry[0], State.BROWSER)  # avertissement « script absent » retiré
+        return True
 
     def link_found(self, page_url, dl_url, user_agent):
         """Retourne True si l'onglet peut être fermé (page ouverte par l'app)."""
@@ -256,22 +314,25 @@ class Engine:
     def _resolver(self):
         # Une page à la fois : le captcha validé une fois vaut pour les liens suivants.
         while True:
-            job = self._to_resolve.get()
+            with self._resolve_ready:
+                while not self._to_resolve:
+                    self._resolve_ready.wait()
+                job = self._to_resolve.pop(0)
+                # enregistré dans la même section que le retrait de la file : pause() le trouve
+                # toujours, dans la file ou dans _waiting
+                key, event = page_key(job.url), threading.Event()
+                self._waiting[key] = (job, event)
             try:
-                self._resolve(job)
+                self._resolve(job, key, event)
             except Exception as e:
                 log.exception("Échec %s", job.url)
                 self.set_state(job, State.ERROR, error_detail(e), speed=0)
 
-    def _resolve(self, job):
-        key, event = page_key(job.url), threading.Event()
-        with self._lock:
-            self._resolve_ids.discard(job.id)
-            if job.id in self._paused:
-                return  # PAUSED déjà publié par pause()
-            self._waiting[key] = (job, event)
+    def _resolve(self, job, key, event):
         try:
-            if job.path and complete_on_disk(job.path, job.total):
+            # Taille inconnue (lien tout juste ajouté) : un fichier du même nom peut être tronqué ou
+            # d'une autre version, la comparaison se fera avec la taille annoncée par le serveur.
+            if job.path and job.total is not None and complete_on_disk(job.path, job.total):
                 self.set_state(job, State.PRESENT)
                 return
             if not is_page_url(job.url):
@@ -280,10 +341,17 @@ class Engine:
                 return
             self.set_state(job, State.BROWSER)
             self.open_page(job.url)
-            received = event.wait(LINK_TIMEOUT)
+            received = event.wait(SCRIPT_TIMEOUT)
+            if not received:
+                with self._lock:
+                    silent = key not in self._checked
+                if silent:
+                    self.set_state(job, State.BROWSER, NO_SCRIPT)
+                received = event.wait(LINK_TIMEOUT - SCRIPT_TIMEOUT)
         finally:
             with self._lock:
                 self._waiting.pop(key, None)
+                self._checked.discard(key)
                 paused = job.id in self._paused
         if paused:
             self.set_state(job, State.PAUSED)
@@ -309,9 +377,12 @@ class Engine:
                 threading.Thread(target=self._run_download, args=(job,), daemon=True).start()
 
     def _run_download(self, job):
-        requeued = False
+        requeued, retry = False, None
         try:
             self._download(job)
+            with self._lock:
+                self._retries.pop(job.id, None)
+                self._reopened.discard(job.id)
         except Cancelled:
             self.set_state(job, State.PAUSED, speed=0)
         except ServerBusy as e:
@@ -328,11 +399,25 @@ class Engine:
                 self.set_state(job, State.QUEUED, f"En attente : le serveur limite à {others} fichier(s) à la fois",
                                speed=0)
             else:
-                self.set_state(job, State.ERROR, f"Erreur : le serveur refuse la connexion ({e}), réessaie plus tard",
-                               speed=0)
+                retry = self._failed(job, f"Erreur : le serveur refuse la connexion ({e})", retry=True)
+        except LinkExpired as e:
+            with self._lock:
+                reopen = job.id not in self._reopened and job.id not in self._paused and is_page_url(job.url)
+                if reopen:
+                    self._reopened.add(job.id)
+            if reopen:  # une seule fois : la page redonne un lien neuf (captcha éventuel)
+                log.info("Lien direct refusé (%s) : réouverture de %s", e, job.url)
+                self._start(job)
+            else:
+                self.set_state(job, State.ERROR, f"Erreur : le serveur refuse le téléchargement ({e})", speed=0)
+        except DiskFull as e:
+            self.set_state(job, State.ERROR, f"Erreur : {e}", speed=0)
+        except NETWORK_ERRORS as e:
+            log.warning("Échec réseau %s", job.url, exc_info=True)
+            retry = self._failed(job, error_detail(e), retry=True)
         except Exception as e:
             log.exception("Échec %s", job.url)
-            self.set_state(job, State.ERROR, error_detail(e), speed=0)
+            self._failed(job, error_detail(e), retry=False)
         finally:
             with self._lock:
                 self._dl_active -= 1
@@ -340,6 +425,50 @@ class Engine:
                 if not requeued:
                     self._busy_cap = None  # une place s'est libérée
             self._pump()
+            if retry:  # après le nettoyage : le nouvel essai ne peut pas croiser celui-ci
+                retry.start()
+
+    def _failed(self, job, detail, retry):
+        """Erreur ; un problème réseau est retenté automatiquement quelques fois (RETRY_DELAYS).
+
+        Retourne le minuteur du nouvel essai, à démarrer par l'appelant (ou None).
+        """
+        with self._lock:
+            attempt = self._retries.get(job.id, 0)
+            retry = retry and attempt < len(RETRY_DELAYS) and job.id not in self._paused
+            if retry:
+                delay = RETRY_DELAYS[attempt]
+                self._retries[job.id] = attempt + 1
+                timer = threading.Timer(delay, self._retry_now, (job,))
+                timer.daemon = True
+                self._retry_timers[job.id] = timer
+        if not retry:
+            self.set_state(job, State.ERROR, detail, speed=0)
+            return None
+        log.info("Nouvel essai de %s dans %d s (%s)", job.url, delay, detail)
+        self.set_state(job, State.RETRY, f"{detail} — nouvel essai dans {duration(delay)}", speed=0)
+        return timer
+
+    def _retry_now(self, job):
+        with self._lock:
+            if self._retry_timers.pop(job.id, None) is None:
+                return  # annulé : pause, reprise manuelle
+        self._start(job)
+
+    def _check_space(self, job, d, final):
+        """Lève DiskFull si le disque ne peut pas recevoir la fin de ce fichier et des autres en cours."""
+        need = d.bytes_to_write(final)
+        if not need:
+            return
+        drive = os.path.splitdrive(os.path.abspath(final))[0].lower()
+        with self._lock:
+            others = [self._downloaders.get(jid) for path, jid in self._paths.items()
+                      if jid != job.id and os.path.splitdrive(os.path.abspath(path))[0].lower() == drive]
+        need += sum(max(0, (o.total or 0) - o.done) for o in others if o)
+        free = shutil.disk_usage(job.dest).free
+        if need + DISK_MARGIN > free:
+            raise DiskFull(f"espace disque insuffisant, il manque {human_size(need + DISK_MARGIN - free)} "
+                           f"(libre : {human_size(free)})")
 
     def _download(self, job):
         url = job.dl_url
@@ -356,8 +485,8 @@ class Engine:
         except Refused as e:
             if e.busy:
                 raise ServerBusy(str(e)) from e  # lien valable, serveur saturé : on le garde
-            job.dl_url = None  # lien sans doute expiré : « Réessayer » rouvrira la page
-            raise RuntimeError(f"le serveur refuse le téléchargement ({e})") from e
+            job.dl_url = None  # lien sans doute expiré : la page sera rouverte
+            raise LinkExpired(str(e)) from e
         if d.cancelled:
             raise Cancelled("en pause")
         name = job.name or safe_name(d.filename or "") or safe_name(
@@ -371,9 +500,10 @@ class Engine:
         with self._lock:
             if final in self._paths:
                 raise RuntimeError("ce fichier est déjà en cours de téléchargement")
-            self._paths.add(final)
+            self._paths[final] = job.id
         try:
             os.makedirs(job.dest, exist_ok=True)
+            self._check_space(job, d, final)
             conns = min(d.connections, max(1, (d.total or 0) // (4 << 20))) if d.ranges else 1
             self.set_state(job, State.DOWNLOADING, f"Téléchargement ({conns} connexion{'s' if conns > 1 else ''})",
                            name=name, total=d.total)
@@ -387,5 +517,5 @@ class Engine:
             raise
         finally:
             with self._lock:
-                self._paths.discard(final)
+                self._paths.pop(final, None)
         self.set_state(job, State.DONE, done=d.done, total=d.total or d.done, speed=0)

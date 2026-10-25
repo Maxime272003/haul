@@ -17,6 +17,10 @@ DEFAULTS = {
     "notify": True,      # notifications Windows (captcha à valider, liste terminée…)
     "theme": "system",   # apparence : system (celle de Windows), light ou dark
     "token": "",         # secret partagé avec le userscript, généré au premier lancement
+    "subfolders": True,  # un sous-dossier par jeu (nom de l'archive) dans le dossier de destination
+    "delete_archives": False,  # archives envoyées à la corbeille après une extraction réussie
+    "tray": True,        # icône dans la zone de notification ; réduire y range la fenêtre
+    "script_version": "",  # dernière version du userscript qui s'est manifestée ("?" : avant la 3.3)
 }
 
 
