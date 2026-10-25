@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from haul.server import MAX_BODY, LinkServer
+from haul.server import MAX_BODY, LinkServer, show_running_instance
 
 TOKEN = "t" * 43
 
@@ -13,7 +13,7 @@ class FakeEngine:
     def __init__(self):
         self.found = []
 
-    def is_waiting(self, page_url):
+    def page_checked(self, page_url):
         return page_url.endswith("/wanted")
 
     def link_found(self, page_url, dl_url, user_agent):
@@ -23,10 +23,11 @@ class FakeEngine:
 
 @pytest.fixture
 def server():
-    engine, bad = FakeEngine(), []
-    srv = LinkServer(engine, TOKEN, port=0, on_bad_token=bad.append)
+    engine, bad, scripts, shown = FakeEngine(), [], [], []
+    srv = LinkServer(engine, TOKEN, port=0, on_bad_token=bad.append, on_script=scripts.append,
+                     on_show=lambda: shown.append(True))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    srv.bad_tokens = bad
+    srv.bad_tokens, srv.scripts, srv.shown = bad, scripts, shown
     yield srv, engine
     srv.shutdown()
 
@@ -131,3 +132,21 @@ def test_token_is_readable_by_the_extension_only(server):
     for dest in ("script", "iframe", "document"):
         assert request(srv, "GET", "/token", token=None, headers={"Sec-Fetch-Dest": dest})[0] == 403
     assert request(srv, "GET", "/token", token=None, host="evil.example:17655")[0] == 403
+
+
+def test_reports_userscript_version(server):
+    srv, _ = server
+    request(srv, "POST", "/wanted", {"page_url": "https://fuckingfast.co/a"}, headers={"X-Haul-Script": "3.3"})
+    request(srv, "POST", "/wanted", {"page_url": "https://fuckingfast.co/a"})  # script 3.2 : sans version
+    request(srv, "POST", "/wanted", {"page_url": "https://fuckingfast.co/a"}, headers={"X-Haul-Script": "<b>"})
+    assert srv.scripts == ["3.3", "", ""]
+
+
+def test_second_launch_brings_running_instance_to_front(server):
+    srv, _ = server
+    assert show_running_instance(TOKEN, port=srv.server_address[1])
+    assert srv.shown == [True]
+    assert not show_running_instance("mauvais", port=srv.server_address[1])
+    # une page web ne peut pas le déclencher, même avec le jeton
+    assert request(srv, "POST", "/show", {}, origin="moz-extension://abc")[0] == 403
+    assert srv.shown == [True]

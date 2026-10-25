@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Haul — FuckingFast
 // @namespace    haul.local
-// @version      3.2
+// @version      3.3
 // @description  Envoie le lien de téléchargement FuckingFast à l'app Haul, qui télécharge hors du navigateur.
 // @match        https://fuckingfast.co/*
 // @match        https://www.fuckingfast.co/*
@@ -18,6 +18,8 @@
   "use strict";
 
   const APP = "http://127.0.0.1:17655";
+  // envoyée à Haul, qui affiche si le script est bien actif (et à jour)
+  const VERSION = (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || "";
   // Secret propre à ton installation de Haul, exigé sur chaque requête. Il n'est pas écrit dans ce
   // script : on le demande à Haul (seule une extension peut lire la réponse), et on le redemande si
   // Haul le refuse. Rien à réinstaller quand il change.
@@ -64,7 +66,8 @@
   }
 
   function api(path, body, onload, onerror, retried) {
-    withToken((t) => request("POST", path, body, { "Content-Type": "application/json", "X-Haul-Token": t },
+    withToken((t) => request("POST", path, body,
+      { "Content-Type": "application/json", "X-Haul-Token": t, "X-Haul-Script": VERSION },
       onload, (code) => {
         if (code === 401 && !retried) {  // jeton changé côté Haul : on le redemande une fois
           token = null;

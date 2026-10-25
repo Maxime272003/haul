@@ -2,7 +2,10 @@ import queue
 import threading
 import time
 
-from haul.engine import Engine, Job, State
+import pytest
+
+from haul import engine as engine_module
+from haul.engine import NO_SCRIPT, DiskFull, Engine, Job, LinkExpired, State
 
 
 def wait_state(events, job_id, state, timeout=5):
@@ -77,8 +80,18 @@ def test_existing_file_is_skipped(tmp_path):
     (tmp_path / "Jeu.rar").write_bytes(b"x")
     events = queue.Queue()
     engine = Engine(events, lambda *link: None, open_page=lambda url: None)
-    engine.submit(Job(1, "https://fuckingfast.co/a#Jeu.rar", str(tmp_path), name="Jeu.rar"))
+    engine.submit(Job(1, "https://fuckingfast.co/a#Jeu.rar", str(tmp_path), name="Jeu.rar", total=1))
     wait_state(events, 1, State.PRESENT)
+
+
+def test_existing_file_of_unknown_size_is_checked_against_the_server(tmp_path):
+    # lien tout juste ajouté : un fichier du même nom peut être tronqué ou d'une autre version
+    (tmp_path / "Jeu.rar").write_bytes(b"x")
+    events, opened = queue.Queue(), []
+    engine = Engine(events, lambda *link: None, open_page=opened.append)
+    engine.submit(Job(1, "https://fuckingfast.co/a#Jeu.rar", str(tmp_path), name="Jeu.rar"))
+    wait_state(events, 1, State.BROWSER)
+    assert opened == ["https://fuckingfast.co/a#Jeu.rar"]
 
 
 def test_existing_file_with_wrong_size_is_not_skipped(tmp_path):
@@ -223,3 +236,100 @@ def test_pause_with_discard_deletes_partial_file_once_stopped(tmp_path, file_ser
     engine.pause(job, discard=True)  # « Tout supprimer » avec les téléchargements inachevés
     wait_state(events, 1, State.PAUSED)
     assert list(tmp_path.iterdir()) == []  # ni .part ni .part.json (réécrit à l'arrêt)
+
+
+def test_network_error_is_retried_automatically_then_gives_up(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine_module, "RETRY_DELAYS", (0.05, 0.05))
+    events, calls = queue.Queue(), []
+    engine = Engine(events, lambda *link: None, open_page=lambda url: None)
+
+    def fake_download(job):
+        calls.append(job.id)
+        raise ConnectionResetError("connexion coupée")
+
+    engine._download = fake_download
+    engine.submit(Job(1, "https://fuckingfast.co/a", str(tmp_path), dl_url="https://dl.fuckingfast.co/dl/a"))
+    fields = wait_state(events, 1, State.RETRY)
+    assert "nouvel essai dans" in fields["detail"]
+    fields = wait_state(events, 1, State.ERROR)
+    assert "connexion coupée" in fields["detail"]
+    assert calls == [1, 1, 1]  # 1er essai + 2 nouveaux essais
+
+
+def test_pause_cancels_scheduled_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine_module, "RETRY_DELAYS", (0.3,))
+    events, calls = queue.Queue(), []
+    engine = Engine(events, lambda *link: None, open_page=lambda url: None)
+    engine._download = lambda job: calls.append(job.id) or (_ for _ in ()).throw(TimeoutError("délai"))
+    job = Job(1, "https://fuckingfast.co/a", str(tmp_path), dl_url="https://dl.fuckingfast.co/dl/a")
+    engine.submit(job)
+    wait_state(events, 1, State.RETRY)
+    engine.pause(job)
+    wait_state(events, 1, State.PAUSED)
+    time.sleep(0.5)
+    assert calls == [1]
+
+
+def test_expired_link_reopens_the_page_once(tmp_path):
+    events, opened, calls = queue.Queue(), [], []
+    engine = Engine(events, lambda *link: None, open_page=opened.append)
+
+    def fake_download(job):
+        calls.append(job.dl_url)
+        job.dl_url = None
+        raise LinkExpired("HTTP 403")
+
+    engine._download = fake_download
+    job = Job(1, "https://fuckingfast.co/a", str(tmp_path), dl_url="https://dl.fuckingfast.co/dl/old")
+    engine.submit(job)  # lien restauré d'une session précédente, expiré depuis
+    wait_state(events, 1, State.BROWSER)
+    assert opened == ["https://fuckingfast.co/a"]
+    send_link(engine, "https://fuckingfast.co/a")
+    fields = wait_state(events, 1, State.ERROR)  # le lien neuf est refusé aussi : on s'arrête là
+    assert "refuse" in fields["detail"]
+    assert opened == ["https://fuckingfast.co/a"]
+
+
+def test_not_enough_disk_space(tmp_path, monkeypatch, file_server):
+    srv = file_server()
+    monkeypatch.setattr(engine_module.shutil, "disk_usage", lambda path: type("U", (), {"free": 1 << 20})())
+    events = queue.Queue()
+    engine = Engine(events, lambda *link: None, open_page=lambda url: None)
+    job = Job(1, "https://fuckingfast.co/a#f.bin", str(tmp_path), name="f.bin", dl_url=srv.url)
+    engine.submit(job)
+    fields = wait_state(events, 1, State.ERROR)
+    assert "espace disque insuffisant" in fields["detail"]
+    assert job.dl_url == srv.url  # lien gardé : « Réessayer » repart sans rouvrir la page
+    assert list(tmp_path.iterdir()) == []
+    with pytest.raises(DiskFull):
+        engine._check_space(job, type("D", (), {"bytes_to_write": lambda self, path: 1 << 30})(),
+                            str(tmp_path / "f.bin"))
+
+
+def test_prioritize_reorders_pages_to_open(tmp_path):
+    events, opened = queue.Queue(), []
+    engine = Engine(events, lambda *link: None, open_page=opened.append)
+    engine._download = lambda job: None
+    jobs = [Job(i, f"https://fuckingfast.co/{i}", str(tmp_path)) for i in (1, 2, 3)]
+    for job in jobs:
+        engine.submit(job)
+    wait_state(events, 1, State.BROWSER)
+    engine.prioritize([jobs[2]])
+    send_link(engine, "https://fuckingfast.co/1")
+    wait_state(events, 3, State.BROWSER)
+    assert opened == ["https://fuckingfast.co/1", "https://fuckingfast.co/3"]
+
+
+def test_warns_when_the_userscript_does_not_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine_module, "SCRIPT_TIMEOUT", 0.1)
+    events = queue.Queue()
+    engine = Engine(events, lambda *link: None, open_page=lambda url: None)
+    engine.submit(Job(1, "https://fuckingfast.co/a", str(tmp_path)))
+    wait_state(events, 1, State.BROWSER)
+    fields = wait_state(events, 1, State.BROWSER)
+    assert fields["detail"] == NO_SCRIPT
+    job = engine._waiting[next(iter(engine._waiting))][0]
+    job.detail = NO_SCRIPT  # appliqué par l'interface
+    assert engine.page_checked("https://fuckingfast.co/a#nom")  # le script finit par se manifester
+    assert wait_state(events, 1, State.BROWSER)["detail"] == ""
+    assert not engine.page_checked("https://fuckingfast.co/autre")

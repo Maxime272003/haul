@@ -2,7 +2,8 @@
 
 Utilise curl_cffi (empreinte réseau de Chrome) car Cloudflare rejette les clients HTTP Python classiques.
 Le fichier est découpé en segments téléchargés en parallèle ; l'avancement est sauvegardé dans
-<fichier>.part.json pour pouvoir reprendre après une coupure.
+<fichier>.part.json pour pouvoir reprendre après une coupure. En fin de fichier, une connexion libre
+prend la moitié du plus gros segment restant au lieu d'attendre les autres.
 """
 import json
 import os
@@ -15,10 +16,12 @@ from curl_cffi import requests as creq
 
 MIN_SEGMENT = 4 << 20
 MAX_SEGMENT = 256 << 20
+SPLIT_MIN = 8 << 20  # moitié minimale d'un segment partagé avec une connexion libre
 TIMEOUT = (15, 60)  # connexion, inactivité
 MAX_RETRIES = 6
 PROBE_BACKOFF = (5, 15, 30)  # s d'attente quand la sonde reçoit 429/503
 WRITE_BUFFER = 1 << 20
+LIMIT_CHECK = 1.0  # s entre deux relectures du débit maximal pendant une requête
 
 CONTENT_RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)")
 
@@ -40,6 +43,10 @@ class Cancelled(Exception):
 
 class Throttled(IOError):
     """Le serveur refuse une connexion de plus (429/503)."""
+
+
+# Échecs réseau (coupure, délai dépassé, réponse inattendue) : un nouvel essai plus tard peut réussir.
+NETWORK_ERRORS = (OSError, creq.RequestsError)
 
 
 def _set_sparse(f):
@@ -121,8 +128,26 @@ class Downloader:
         s.cookies.update(self.cookies)
         return s
 
-    def _get(self, s, **kwargs):
-        return s.get(self.url, stream=True, timeout=TIMEOUT, max_recv_speed=int(self.speed_limit() or 0), **kwargs)
+    def _get(self, s, speed=0, **kwargs):
+        return s.get(self.url, stream=True, timeout=TIMEOUT, max_recv_speed=speed, **kwargs)
+
+    def _speed(self):
+        return int(self.speed_limit() or 0)
+
+    def _speed_changed(self, speed):
+        """Le débit maximal a assez changé pour relancer la requête en cours (réglage, connexions ouvertes)."""
+        new = self._speed()
+        return (new == 0) != (speed == 0) or abs(new - speed) > speed * 0.2
+
+    def bytes_to_write(self, final_path):
+        """Octets qui restent à écrire sur le disque pour ce fichier (reprise comprise)."""
+        if not self.total:
+            return 0
+        if self.ranges:
+            segments = self._load_state(final_path + ".part.json", final_path + ".part")
+            if segments is not None:
+                return sum(max(0, end - pos + 1) for _, end, pos in segments)
+        return self.total
 
     def cancel(self):
         self._stop.set()
@@ -191,6 +216,7 @@ class Downloader:
         n_workers = min(self.connections, len(todo))
         self._counts = [0] * n_workers
         alive = [n_workers]
+        busy = {}  # index de la connexion -> segment en cours
         self.active_connections = n_workers
 
         def worker(index):
@@ -200,15 +226,17 @@ class Downloader:
                 with open(part, "r+b", buffering=WRITE_BUFFER) as f:
                     while not self._stop.is_set():
                         with self._lock:
-                            if not todo:
+                            seg = todo.pop(0) if todo else self._split(busy, segments)
+                            if seg is None:
                                 return
-                            seg = todo.pop(0)
+                            busy[index] = seg
                         try:
                             self._fetch_segment(s, seg, f, index)
                             throttled = 0
                         except Throttled:
                             # Trop de connexions : on rend le segment et on laisse les autres continuer.
                             with self._lock:
+                                del busy[index]
                                 self.refusals += 1
                                 todo.insert(0, seg)
                                 if alive[0] > 1:
@@ -217,6 +245,9 @@ class Downloader:
                             if throttled > MAX_RETRIES:
                                 raise
                             time.sleep(5 * throttled)
+                            continue
+                        with self._lock:
+                            del busy[index]
             except Exception as e:
                 self._error = self._error or e
                 self._stop.set()
@@ -245,11 +276,28 @@ class Downloader:
         on_progress(self.total, self.total)
         os.remove(state_path)
 
+    @staticmethod
+    def _split(busy, segments):
+        """Coupe en deux le plus gros segment en cours et retourne la seconde moitié (ou None).
+
+        Appelé sous verrou. La connexion qui télécharge ce segment s'arrête à sa nouvelle fin (elle
+        relit seg[1] à chaque bloc) ; la coupure est loin devant sa position, au-delà de son tampon.
+        """
+        seg = max(busy.values(), key=lambda s: s[1] - s[2], default=None)
+        if seg is None or seg[1] - seg[2] + 1 < 2 * SPLIT_MIN:
+            return None
+        mid = seg[2] + (seg[1] - seg[2] + 1) // 2
+        new = [mid, seg[1], mid]
+        seg[1] = mid - 1
+        segments.append(new)
+        return new
+
     def _fetch_segment(self, s, seg, f, index):
         """Télécharge seg = [début, fin, position] dans le fichier ouvert f.
 
         Les octets sont écrits (tampon vidé) avant d'avancer la position : l'état sauvegardé ne
-        prétend jamais avoir plus que ce qui est sur le disque.
+        prétend jamais avoir plus que ce qui est sur le disque. La fin du segment peut reculer
+        pendant la requête (partage avec une connexion libre) : seg[1] est relu à chaque bloc.
         """
         errors = 0
         while seg[2] <= seg[1]:
@@ -257,7 +305,8 @@ class Downloader:
                 return
             pending = 0  # octets écrits dans le tampon, pas encore comptés dans seg[2]
             try:
-                r = self._get(s, headers={"Range": f"bytes={seg[2]}-{seg[1]}"})
+                speed = self._speed()
+                r = self._get(s, speed, headers={"Range": f"bytes={seg[2]}-{seg[1]}"})
                 try:
                     if r.status_code in (429, 503):
                         raise Throttled(f"HTTP {r.status_code}")
@@ -268,10 +317,11 @@ class Downloader:
                         # plage inattendue : écrire ces octets corromprait le fichier
                         raise OSError(f"plage inattendue ({r.headers.get('Content-Range')!r}) sur un segment")
                     f.seek(seg[2])
+                    checked = time.monotonic()
                     for chunk in r.iter_content():
                         if self._stop.is_set():
                             break
-                        chunk = chunk[: seg[1] - seg[2] - pending + 1]
+                        chunk = chunk[: max(0, seg[1] - seg[2] - pending + 1)]
                         f.write(chunk)
                         pending += len(chunk)
                         self._counts[index] += len(chunk)
@@ -282,6 +332,10 @@ class Downloader:
                             pending = 0
                             if seg[2] > seg[1]:
                                 break
+                        if time.monotonic() - checked > LIMIT_CHECK:
+                            checked = time.monotonic()
+                            if self._speed_changed(speed):
+                                break  # nouvelle requête au nouveau débit, sans attendre la fin du segment
                     f.flush()
                     seg[2] += pending
                 finally:
@@ -320,7 +374,7 @@ class Downloader:
         self._base, self._counts = 0, [0]
         self.active_connections = 1
         try:
-            r = self._get(s)
+            r = self._get(s, self._speed())
             try:
                 if r.status_code != 200:
                     raise OSError(f"HTTP {r.status_code}")

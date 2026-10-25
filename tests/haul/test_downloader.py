@@ -115,3 +115,44 @@ def test_probe_waits_when_server_is_busy(file_server, monkeypatch):
     assert d.total == len(DATA)
     with pytest.raises(Refused, match="429"):
         Downloader(file_server(busy_first=5).url, "x", NO_AUTH).probe()
+
+
+def test_free_connection_takes_half_of_the_biggest_remaining_segment(file_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(downloader, "SPLIT_MIN", 1 << 20)
+    srv = file_server()
+    out = tmp_path / "f.bin"
+    fetch(srv.url, out, connections=2)  # 3 segments de 4 Mo pour 2 connexions
+    assert out.read_bytes() == DATA
+    # la connexion qui finit en premier prend le 3e segment, l'autre en prend ensuite la moitié
+    assert len(srv.ranges_asked) > 3
+
+
+def test_split_cuts_the_biggest_segment_in_two():
+    segments = [[0, 99, 10], [100, 199, 100]]
+    assert Downloader._split({0: segments[0], 1: segments[1]}, segments) is None  # trop petits
+    big = [[0, (40 << 20) - 1, 0]]
+    new = Downloader._split({0: big[0]}, big)
+    assert big == [[0, (20 << 20) - 1, 0], [20 << 20, (40 << 20) - 1, 20 << 20]] and new is big[1]
+
+
+def test_speed_limit_change_applies_during_a_segment(file_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(downloader, "LIMIT_CHECK", 0.1)
+    srv = file_server()
+    limit = [256 << 10]  # 256 Ko/s : 12 Mo prendraient 45 s
+    d = Downloader(srv.url, "x", NO_AUTH, 1, speed_limit=lambda: limit[0])
+    d.probe()
+    threading.Timer(0.5, lambda: limit.__setitem__(0, 0)).start()  # limite levée en cours de route
+    start = time.monotonic()
+    d.download(str(tmp_path / "f.bin"), lambda done, total: None)
+    assert time.monotonic() - start < 10
+    assert (tmp_path / "f.bin").read_bytes() == DATA
+
+
+def test_bytes_to_write_accounts_for_resume_state(tmp_path):
+    d = Downloader("u", "x", NO_AUTH)
+    d.total, d.ranges = 100, True
+    final = str(tmp_path / "f.bin")
+    assert d.bytes_to_write(final) == 100
+    (tmp_path / "f.bin.part").write_bytes(b"\0" * 100)
+    (tmp_path / "f.bin.part.json").write_text('{"total": 100, "segments": [[0, 49, 50], [50, 99, 60]]}')
+    assert d.bytes_to_write(final) == 40
