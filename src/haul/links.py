@@ -29,7 +29,7 @@ def human_size(n):
 
 def duration(seconds):
     """Durée courte et lisible : « 45 s », « 12 min », « 2 h 05 »."""
-    seconds = max(0, int(seconds))
+    seconds = max(0, round(seconds))
     if seconds < 60:
         return f"{seconds} s"
     minutes = round(seconds / 60)

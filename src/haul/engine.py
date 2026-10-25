@@ -377,7 +377,7 @@ class Engine:
                 threading.Thread(target=self._run_download, args=(job,), daemon=True).start()
 
     def _run_download(self, job):
-        requeued = False
+        requeued, retry = False, None
         try:
             self._download(job)
             with self._lock:
@@ -399,7 +399,7 @@ class Engine:
                 self.set_state(job, State.QUEUED, f"En attente : le serveur limite à {others} fichier(s) à la fois",
                                speed=0)
             else:
-                self._failed(job, f"Erreur : le serveur refuse la connexion ({e})", retry=True)
+                retry = self._failed(job, f"Erreur : le serveur refuse la connexion ({e})", retry=True)
         except LinkExpired as e:
             with self._lock:
                 reopen = job.id not in self._reopened and job.id not in self._paused and is_page_url(job.url)
@@ -414,7 +414,7 @@ class Engine:
             self.set_state(job, State.ERROR, f"Erreur : {e}", speed=0)
         except NETWORK_ERRORS as e:
             log.warning("Échec réseau %s", job.url, exc_info=True)
-            self._failed(job, error_detail(e), retry=True)
+            retry = self._failed(job, error_detail(e), retry=True)
         except Exception as e:
             log.exception("Échec %s", job.url)
             self._failed(job, error_detail(e), retry=False)
@@ -425,9 +425,14 @@ class Engine:
                 if not requeued:
                     self._busy_cap = None  # une place s'est libérée
             self._pump()
+            if retry:  # après le nettoyage : le nouvel essai ne peut pas croiser celui-ci
+                retry.start()
 
     def _failed(self, job, detail, retry):
-        """Erreur ; un problème réseau est retenté automatiquement quelques fois (RETRY_DELAYS)."""
+        """Erreur ; un problème réseau est retenté automatiquement quelques fois (RETRY_DELAYS).
+
+        Retourne le minuteur du nouvel essai, à démarrer par l'appelant (ou None).
+        """
         with self._lock:
             attempt = self._retries.get(job.id, 0)
             retry = retry and attempt < len(RETRY_DELAYS) and job.id not in self._paused
@@ -439,10 +444,10 @@ class Engine:
                 self._retry_timers[job.id] = timer
         if not retry:
             self.set_state(job, State.ERROR, detail, speed=0)
-            return
+            return None
         log.info("Nouvel essai de %s dans %d s (%s)", job.url, delay, detail)
         self.set_state(job, State.RETRY, f"{detail} — nouvel essai dans {duration(delay)}", speed=0)
-        timer.start()
+        return timer
 
     def _retry_now(self, job):
         with self._lock:

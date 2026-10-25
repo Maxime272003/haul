@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from haul.server import MAX_BODY, LinkServer, show_running_instance
+from haul.server import MAX_BODY, LinkServer, bundled_script_version, show_running_instance
 
 TOKEN = "t" * 43
 
@@ -150,3 +150,7 @@ def test_second_launch_brings_running_instance_to_front(server):
     # une page web ne peut pas le déclencher, même avec le jeton
     assert request(srv, "POST", "/show", {}, origin="moz-extension://abc")[0] == 403
     assert srv.shown == [True]
+
+
+def test_bundled_script_version():
+    assert bundled_script_version() == "3.3"

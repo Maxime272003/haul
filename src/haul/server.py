@@ -18,6 +18,7 @@ Le jeton n'est pas écrit dans le script : il n'y a jamais besoin de réinstalle
 import hmac
 import json
 import logging
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .links import DL_RE, is_page_url
@@ -121,6 +122,15 @@ class LinkHandler(BaseHTTPRequestHandler):
             return self._reply(400)
         close = self.server.engine.link_found(page_url, dl_url, user_agent)
         self._json({"ok": True, "close": close})
+
+
+def bundled_script_version(path=USERSCRIPT_PATH):
+    """Version du userscript livré avec cette version de Haul (ligne @version)."""
+    try:
+        m = re.search(r"^// @version\s+(\S+)", path.read_text(encoding="utf-8"), re.M)
+    except OSError:
+        return ""
+    return m.group(1) if m else ""
 
 
 def show_running_instance(token, port=PORT, timeout=3):

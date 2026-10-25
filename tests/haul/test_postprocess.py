@@ -100,6 +100,17 @@ def test_extracted_content_goes_into_the_game_folder_when_it_only_holds_its_volu
                                                           "setup.exe"]
 
 
+def test_game_folder_created_by_haul_receives_the_content_next_to_bonus_files(tmp_path):
+    game = tmp_path / "Elden Ring"  # « Un dossier par jeu »
+    game.mkdir()
+    first = game / "Elden_Ring_--_fitgirl-repacks.site_--_.part01.rar"
+    first.write_bytes(b"")
+    (game / "fg-optional-bonus.bin").write_bytes(b"")  # doit rester à côté de setup.exe
+    tmp = make_extracted(game, "setup.exe", "fg-01.bin")
+    assert place_extracted(tmp, str(first)) == str(game)
+    assert (game / "setup.exe").exists() and (game / "fg-optional-bonus.bin").exists()
+
+
 def test_extracted_single_folder_never_overwrites_an_existing_one(tmp_path):
     (tmp_path / "Jeu.rar").write_bytes(b"")
     (tmp_path / "autre.txt").write_bytes(b"")

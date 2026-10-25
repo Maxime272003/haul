@@ -10,11 +10,23 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, clipboard, config, notify, postprocess
-from .engine import ACTIVE, ON_DISK, Engine, Job, State, remove_partial
-from .links import FILE_HINT_RE, LINK_RE, human_size, is_page_url, name_from_url, page_key, safe_name
+from . import __version__, clipboard, config, desktop, dialogs, notify, postprocess
+from .engine import ACTIVE, NO_SCRIPT, ON_DISK, Engine, Job, State, remove_partial
+from .links import (
+    DL_RE,
+    FILE_HINT_RE,
+    LINK_RE,
+    archive_base,
+    duration,
+    folder_name,
+    human_size,
+    is_page_url,
+    name_from_url,
+    page_key,
+    safe_name,
+)
 from .paths import ICON_PATH, QUEUE_PATH
-from .server import PORT, USERSCRIPT_URL, LinkServer
+from .server import PORT, USERSCRIPT_URL, LinkServer, bundled_script_version
 from .theme import Theme
 from .widgets import CellTooltip, ChoiceStepper, Flow, Stepper
 
@@ -25,18 +37,22 @@ STATUS_DOTS = {"info": "faint", "ok": "green", "warn": "amber", "error": "red"}
 SPEED_CHOICES = (0, 1, 2, 5, 10, 20, 50, 100)  # débit total maximal, Mo/s (0 = illimité)
 CAPTCHA_ALERT_AFTER = 10  # secondes dans le navigateur sans lien reçu : on prévient
 NOTIFICATION_LIFETIME = 30_000  # ms avant de retirer l'icône de notification
-VT_KEY_URL = "https://www.virustotal.com/gui/my-apikey"
-EICAR_SHA256 = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"  # connu de VirusTotal
+LINK_MAX_AGE = 24 * 3600  # s pendant lesquelles un lien direct sauvegardé vaut la peine d'être essayé
 
 KINDS = {
-    State.WAITING: "wait", State.QUEUED: "wait", State.BROWSER: "browser", State.PAUSED: "paused",
-    State.CONNECTING: "busy", State.CHECKING: "busy", State.EXTRACTING: "busy", State.DOWNLOADING: "download",
-    State.DONE: "done", State.PRESENT: "done", State.EXTRACTED: "done",
+    State.WAITING: "wait", State.QUEUED: "wait", State.RETRY: "wait", State.BROWSER: "browser",
+    State.PAUSED: "paused", State.CONNECTING: "busy", State.CHECKING: "busy", State.EXTRACTING: "busy",
+    State.DOWNLOADING: "download", State.DONE: "done", State.PRESENT: "done", State.EXTRACTED: "done",
     State.ERROR: "error", State.EXTRACT_FAILED: "error", State.BLOCKED: "error",
 }
+# Ordre des familles pour le tri par statut et l'icône d'un groupe (la plus importante d'abord)
+KIND_ORDER = ("error", "browser", "download", "busy", "paused", "wait", "done")
 # Repris tels quels au lancement suivant ; les autres (en cours à la fermeture) passent en pause.
 RESTORED = frozenset({State.DONE, State.PRESENT, State.EXTRACTED, State.EXTRACT_FAILED, State.BLOCKED,
                       State.ERROR, State.PAUSED})
+COLUMNS = ("#0", "status", "progress", "speed", "vt")
+HEADINGS = {"#0": "FICHIER", "status": "STATUT", "progress": "PROGRESSION", "speed": "VITESSE",
+            "vt": "VIRUSTOTAL"}
 
 
 def status_kind(state):
@@ -44,23 +60,57 @@ def status_kind(state):
     return KINDS[state]
 
 
-def plural(n, word, plural_word=None):
-    return f"{n} {word if n < 2 else plural_word or word + 's'}"
+plural = dialogs.plural
 
 
 def speed_label(mb):
     return f"{mb} Mo/s" if mb else "illimité"
 
 
+def progress_label(done, total):
+    if total and done >= total:
+        return human_size(total)
+    if total:
+        done_text, total_text = human_size(done), human_size(total)
+        if done_text.split()[-1] == total_text.split()[-1]:
+            done_text = done_text.split()[0]  # « 312.0 / 500.0 Mo »
+        return f"{done * 100 // total} %  ·  {done_text} / {total_text}"
+    return human_size(done) if done else ""
+
+
+def eta(done, total, speed):
+    """Temps restant en secondes, ou None si on ne peut pas l'estimer."""
+    if not total or speed <= 0 or done >= total:
+        return None
+    return (total - done) / speed
+
+
+def sort_key(column):
+    """Clé de tri d'un fichier pour une colonne de la liste."""
+    return {
+        "#0": lambda j: (j.name or j.url).lower(),
+        "status": lambda j: (KIND_ORDER.index(KINDS[j.state]), j.status.lower()),
+        "progress": lambda j: j.done / j.total if j.total else -1,
+        "speed": lambda j: j.speed if j.state == State.DOWNLOADING else -1,
+        "vt": lambda j: j.vt.lower(),
+    }[column]
+
+
 # --- sauvegarde de la liste entre deux lancements ---
 
-def dump_jobs(jobs):
+def dump_jobs(jobs, now=None):
+    now = time.time() if now is None else now
     return [{"url": j.url, "dest": j.dest, "name": j.name, "state": j.state.value, "detail": j.detail,
-             "done": j.done, "total": j.total, "vt": j.vt, "processed": j.processed} for j in jobs]
+             "done": j.done, "total": j.total, "vt": j.vt, "processed": j.processed,
+             # lien direct gardé : la reprise n'a pas à rouvrir la page s'il est encore valable
+             **({"dl_url": j.dl_url, "user_agent": j.user_agent, "saved": now}
+                if j.dl_url and j.state not in ON_DISK else {})}
+            for j in jobs]
 
 
-def load_jobs(items, first_id=1):
+def load_jobs(items, first_id=1, now=None):
     """Jobs sauvegardés par dump_jobs ; ce qui était en cours revient en pause."""
+    now = time.time() if now is None else now
     jobs = []
     for item in items if isinstance(items, list) else []:
         try:
@@ -78,15 +128,52 @@ def load_jobs(items, first_id=1):
         name = item.get("name")
         total = item.get("total")
         done = item.get("done")
+        dl_url, user_agent, saved = item.get("dl_url"), item.get("user_agent"), item.get("saved")
+        if not (isinstance(dl_url, str) and DL_RE.fullmatch(dl_url) and isinstance(saved, (int, float))
+                and 0 <= now - saved < LINK_MAX_AGE):
+            dl_url = None
+        if not (dl_url and isinstance(user_agent, str) and len(user_agent) <= 512 and user_agent.isprintable()):
+            user_agent = None
         jobs.append(Job(id=first_id + len(jobs), url=url, dest=dest,
                         name=safe_name(name) if isinstance(name, str) else None, state=state, detail=detail,
                         done=done if isinstance(done, int) else 0, total=total if isinstance(total, int) else None,
+                        dl_url=dl_url, user_agent=user_agent,
                         vt=item.get("vt") if isinstance(item.get("vt"), str) else "", processed=processed))
     return jobs
 
 
+def group_summary(jobs):
+    """Ligne de groupe (volumes d'un même jeu) : (famille, fraction, statut, progression, vitesse, verdict)."""
+    kinds = {}
+    for job in jobs:
+        kinds[KINDS[job.state]] = kinds.get(KINDS[job.state], 0) + 1
+    kind = next(k for k in KIND_ORDER if k in kinds)
+    if len(kinds) == 1 and len({j.status for j in jobs}) == 1:
+        status = jobs[0].status
+    else:
+        names = {"error": ("erreur", "erreurs"), "browser": ("dans le navigateur", "dans le navigateur"),
+                 "download": ("en cours", "en cours"), "busy": ("en cours", "en cours"),
+                 "paused": ("en pause", "en pause"), "wait": ("en attente", "en attente"),
+                 "done": ("terminé", "terminés")}
+        counts = {}
+        for k in KIND_ORDER:
+            if k in kinds:
+                label = names[k][kinds[k] > 1]
+                counts[label] = counts.get(label, 0) + kinds[k]
+        status = "  ·  ".join(f"{n} {label}" for label, n in counts.items())
+    sized = [j for j in jobs if j.total]
+    done, total = sum(min(j.done, j.total) for j in sized), sum(j.total for j in sized)
+    progress = progress_label(done, total) if len(sized) == len(jobs) else ""
+    speed = sum(j.speed for j in jobs if j.state == State.DOWNLOADING)
+    left = eta(done, total, speed) if len(sized) == len(jobs) else None
+    speed_text = f"{human_size(speed)}/s" + (f"  ·  {duration(left)}" if left else "") if speed > 0 else ""
+    vts = {j.vt for j in jobs}
+    fraction = done / total if total and kind in ("download", "paused") else None
+    return kind, fraction, status, progress, speed_text, vts.pop() if len(vts) == 1 else ""
+
+
 class App:
-    def __init__(self, root):
+    def __init__(self, root, minimized=False):
         self.root = root
         self.cfg = config.load()
         self.events = queue.Queue()    # (job.id, {champ: valeur}) ou (None, {"message": …, "done": bool, "kind": …})
@@ -96,7 +183,7 @@ class App:
         self.engine.set_parallel(self.cfg["parallel"])
         self.engine.set_connections(self.cfg["connections"])
         self.engine.set_max_speed(self.cfg["max_speed"] << 20)
-        self.jobs = {}
+        self.jobs = {}          # job.id -> Job, dans l'ordre de la file (priorité)
         self.seen = set()
         self.next_id = 1
         self.busy = False       # analyse / extraction en cours
@@ -107,8 +194,16 @@ class App:
         self.last_queue_save = 0.0
         self.browser_since = {}  # job.id -> début de l'attente dans le navigateur
         self.captcha_alerted = set()
+        self.no_script_warned = False
         self.was_active = False
         self.notification_timer = None
+        self.sort = None        # (colonne, décroissant) ou None : ordre de la file
+        self.groups = {}        # postprocess.set_key -> iid de la ligne de groupe
+        self.next_group = 1
+        self.layout_dirty = True
+        self.tray = None
+        self.script_seen = None  # version du userscript qui s'est manifesté pendant cette session
+        root.report_callback_exception = self._on_tk_error
 
         self.theme = Theme(root, self.cfg["theme"])
         px = self.theme.px
@@ -124,18 +219,31 @@ class App:
         self.hwnd = notify.window_handle(root)
         self.taskbar = notify.TaskbarProgress(self.hwnd)
         self.notifier = notify.Notifier(self.hwnd, ICON_PATH if ICON_PATH.exists() else None)
+        self.drop = desktop.FileDrop(root, lambda paths: self.calls.put(lambda: self._add_from_files(paths)))
+        if self.cfg["tray"]:
+            self._start_tray()
+        root.bind("<Unmap>", self._on_unmap, add="+")
         self._restore_queue()
         self.last_seq = clipboard.sequence()
         self.timers = {"clipboard": root.after(700, self._poll_clipboard),
                        "events": root.after(200, self._drain_events)}
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         try:
-            self.server = LinkServer(self.engine, self.cfg["token"],
-                                     on_bad_token=lambda kind: self.calls.put(lambda: self._script_outdated(kind)))
+            self.server = LinkServer(
+                self.engine, self.cfg["token"],
+                on_bad_token=lambda kind: self.calls.put(lambda: self._script_outdated(kind)),
+                on_script=lambda version: self.calls.put(lambda: self._script_active(version)),
+                on_show=lambda: self.calls.put(self._show_window))
             threading.Thread(target=self.server.serve_forever, daemon=True).start()
         except OSError:
             self.server = None
-            self._status(f"Port {PORT} occupé : Haul est peut-être déjà lancé.", "warn")
+            self._port_busy()
+        self._refresh_script_label()
+        if minimized:
+            if self.tray and self.tray.hwnd:
+                root.withdraw()
+            else:
+                root.iconify()
 
     # --- configuration ---
 
@@ -144,7 +252,8 @@ class App:
         self.cfg.update(folder=self.folder_var.get(), parallel=self._spin_value(self.parallel_var, 1, 6),
                         connections=self._spin_value(self.conn_var, 1, 16), max_speed=speed,
                         watch=self.watch_var.get(), scan=self.scan_var.get(), extract=self.extract_var.get(),
-                        notify=self.notify_var.get())
+                        notify=self.notify_var.get(), subfolders=self.subfolders_var.get(),
+                        delete_archives=self.delete_var.get(), tray=self.tray_var.get())
         config.save(self.cfg)
 
     @staticmethod
@@ -162,7 +271,22 @@ class App:
 
     def _switch_changed(self):
         self._save_config()
-        self._postprocess()  # analyse / extraction activée alors que la liste est déjà finie
+        if self.tray_var.get() and not self.tray:
+            self._start_tray()
+        elif not self.tray_var.get() and self.tray:
+            self.tray.stop()
+            self.tray = None
+            self._show_window()
+        self._postprocess()  # analyse / extraction activée alors que des fichiers attendent
+
+    def _autostart_changed(self):
+        on = self.autostart_var.get()
+        if desktop.set_autostart(on):
+            self._status("Haul démarrera avec Windows, réduit dans la zone de notification." if on
+                         else "Haul ne démarrera plus avec Windows.", "ok")
+        else:
+            self.autostart_var.set(desktop.autostart_enabled())
+            self._status("Impossible de modifier le démarrage avec Windows.", "error")
 
     # --- interface ---
 
@@ -184,6 +308,7 @@ class App:
 
         self.root.bind("<Control-v>", self._paste_shortcut)
         self.root.bind("<Control-V>", self._paste_shortcut)
+        self.root.bind("<Control-f>", lambda e: self.filter_entry.focus_set())
 
     def _build_header(self, parent):
         px = self.theme.px
@@ -194,12 +319,14 @@ class App:
             self.logo = icon.subsample(max(1, round(icon.width() / px(40))))
             ttk.Label(header, image=self.logo).grid(row=0, column=0, rowspan=2, padx=(0, px(12)))
         ttk.Label(header, text="Haul", style="Title.TLabel").grid(row=0, column=1, sticky="sw")
-        ttk.Label(header, text=f"Téléchargements FuckingFast · version {__version__}",
-                  style="Muted.TLabel").grid(row=1, column=1, sticky="nw")
+        self.script_var = tk.StringVar()
+        ttk.Label(header, textvariable=self.script_var, style="Muted.TLabel").grid(row=1, column=1, sticky="nw")
         buttons = ttk.Frame(header)
         buttons.grid(row=0, column=2, rowspan=2, sticky="e")
         ttk.Button(buttons, text="Installer le script navigateur",
                    command=lambda: os.startfile(USERSCRIPT_URL)).pack(side="left")
+        ttk.Button(buttons, text="Ajouter des liens…", command=lambda: dialogs.links_dialog(self)).pack(
+            side="left", padx=(px(8), 0))
         ttk.Button(buttons, text="Ajouter depuis le presse-papier", style="Accent.TButton",
                    command=self._add_from_clipboard).pack(side="left", padx=(px(8), 0))
         return header
@@ -231,10 +358,13 @@ class App:
         self.scan_var = tk.BooleanVar(value=self.cfg["scan"])
         self.extract_var = tk.BooleanVar(value=self.cfg["extract"])
         self.notify_var = tk.BooleanVar(value=self.cfg["notify"])
+        self.subfolders_var = tk.BooleanVar(value=self.cfg["subfolders"])
+        self.delete_var = tk.BooleanVar(value=self.cfg["delete_archives"])
+        self.tray_var = tk.BooleanVar(value=self.cfg["tray"])
+        self.autostart_var = tk.BooleanVar(value=desktop.autostart_enabled())
 
-        def switch(text, var):
-            return ttk.Checkbutton(opts, text=text, variable=var, style="Switch.TCheckbutton",
-                                   command=self._switch_changed)
+        def switch(text, var, command=self._switch_changed):
+            return ttk.Checkbutton(opts, text=text, variable=var, style="Switch.TCheckbutton", command=command)
 
         def labelled(text, make):
             box = ttk.Frame(opts, style="Surface.TFrame")
@@ -251,10 +381,14 @@ class App:
             box, self.speed_var, [speed_label(v) for v in SPEED_CHOICES], command=self._settings_changed,
             style="Surface.TFrame"))
         opts.add(switch("Surveiller le presse-papier", self.watch_var), parallel, conns, speed_box,
+                 switch("Un dossier par jeu", self.subfolders_var),
                  switch("Analyser avec VirusTotal", self.scan_var),
                  ttk.Button(opts, text="Clé VirusTotal…", command=self._api_key_dialog),
                  switch("Puis extraire avec WinRAR", self.extract_var),
-                 switch("Notifications", self.notify_var))
+                 switch("Archives à la corbeille après extraction", self.delete_var),
+                 switch("Notifications", self.notify_var),
+                 switch("Icône dans la zone de notification", self.tray_var),
+                 switch("Démarrer avec Windows", self.autostart_var, self._autostart_changed))
         return card
 
     def _build_list_header(self, parent):
@@ -267,6 +401,12 @@ class App:
             row=0, column=1, sticky="w", padx=(px(12), 0))
         self.total_var = tk.StringVar()
         ttk.Label(bar, textvariable=self.total_var, style="Speed.TLabel").grid(row=0, column=2, sticky="e")
+        ttk.Label(bar, text="Filtrer", style="Muted.TLabel").grid(row=0, column=3, sticky="e", padx=(px(16), px(6)))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *_: self._mark_layout())
+        self.filter_entry = ttk.Entry(bar, textvariable=self.filter_var, width=18)
+        self.filter_entry.grid(row=0, column=4, sticky="e")
+        self.filter_entry.bind("<Escape>", lambda e: self.filter_var.set(""))
         return bar
 
     def _build_list(self, parent):
@@ -275,11 +415,10 @@ class App:
         card.columnconfigure(0, weight=1)
         card.rowconfigure(0, weight=1)
 
-        cols = ("status", "progress", "speed", "vt")
-        self.tree = ttk.Treeview(card, columns=cols, show=("tree", "headings"), selectmode="extended", height=6)
-        for col, text in (("#0", "FICHIER"), ("status", "STATUT"), ("progress", "PROGRESSION"),
-                          ("speed", "VITESSE"), ("vt", "VIRUSTOTAL")):
-            self.tree.heading(col, text=text, anchor="w")
+        self.tree = ttk.Treeview(card, columns=COLUMNS[1:], show=("tree", "headings"), selectmode="extended",
+                                 height=6)
+        for col in COLUMNS:
+            self.tree.heading(col, text=HEADINGS[col], anchor="w", command=lambda c=col: self._sort_by(c))
             # largeurs calculées d'après le contenu : voir _fit_columns
             self.tree.column(col, width=px(100), minwidth=px(60), stretch=False, anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
@@ -305,11 +444,14 @@ class App:
         self.tree.bind("<Delete>", lambda e: self._remove(self._selected_jobs()))
         self.tree.bind("<space>", lambda e: self._toggle_pause(self._selected_jobs()))
         self.tree.bind("<Control-a>", lambda e: self.tree.selection_set(self.tree.get_children()) or "break")
+        self.tree.bind("<Alt-Up>", lambda e: self._prioritize(self._selected_jobs(), True) or "break")
+        self.tree.bind("<Alt-Down>", lambda e: self._prioritize(self._selected_jobs(), False) or "break")
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._refresh_pause_button(), add="+")
 
         self.empty = ttk.Frame(card, style="Surface.TFrame")
         ttk.Label(self.empty, text="Aucun téléchargement", style="EmptyTitle.TLabel").pack()
-        ttk.Label(self.empty, text=HINT + "\nLes pages s'ouvrent dans ton navigateur, Haul télécharge le reste.",
+        ttk.Label(self.empty, text=HINT + "\nLes pages s'ouvrent dans ton navigateur, Haul télécharge le reste.\n"
+                                          "Tu peux aussi déposer ici une page enregistrée ou une liste de liens.",
                   style="SurfaceMuted.TLabel", justify="center").pack(pady=(px(6), 0))
         self.empty.place(relx=0.5, rely=0.5, anchor="center")
         return card
@@ -338,15 +480,18 @@ class App:
         text, pad = self._text_width, px(24)
         heading = lambda col: self.theme.font_caption.measure(self.tree.heading(col, "text")) + pad
         jobs = self.jobs.values()
+        groups = [self.tree.item(iid, "text") for iid in self.groups.values() if self.tree.exists(iid)]
         widths = {
             "progress": max([heading("progress"), text("100 %  ·  999.9 / 999.9 Mo") + pad,
                              text("99 %  ·  1023.9 Mo / 99.9 Go") + pad]
                             + [text(self._row(j)[1]) + pad for j in jobs]),
-            "speed": max(heading("speed"), text("1023.9 Mo/s") + pad),
+            "speed": max(heading("speed"), text("1023.9 Mo/s  ·  59 min") + pad),
             "vt": max([heading("vt")] + [text(j.vt) + pad for j in jobs if j.vt]),
         }
         free = max(width - sum(widths.values()) - px(2), 2 * px(120))
-        want_name = max([px(180)] + [text(j.name or j.url) + px(52) for j in jobs])  # icône comprise
+        indent = px(20) if groups else 0  # volumes d'un jeu, en retrait sous leur groupe
+        want_name = max([px(180)] + [text(j.name or j.url) + px(52) + indent for j in jobs]
+                        + [text(g) + px(52) for g in groups])  # icône comprise
         want_status = max([px(180)] + [text(j.status) + pad for j in jobs])
         if want_name + want_status <= free:
             name = want_name
@@ -376,7 +521,7 @@ class App:
         self.suspend_btn = ttk.Button(actions, text="Tout suspendre", command=self._toggle_suspend)
         self.retry_btn = ttk.Button(actions, text="Réessayer les échecs", command=self._retry_failed)
         self.clear_btn = ttk.Button(actions, text="Retirer les terminés", command=self._clear_done)
-        self.clear_all_btn = ttk.Button(actions, text="Tout supprimer", command=self._clear_all_dialog)
+        self.clear_all_btn = ttk.Button(actions, text="Tout supprimer", command=lambda: dialogs.clear_all_dialog(self))
         self.process_btn = ttk.Button(actions, text="Analyser / extraire maintenant",
                                       command=lambda: self._postprocess(manual=True))
         self.report_btn = ttk.Button(actions, text="Rapport VirusTotal", command=self._show_report)
@@ -415,6 +560,14 @@ class App:
             image = self.theme.dot(STATUS_DOTS[self.status_kind])
         self.status_icon.configure(image=image)
 
+    def _on_tk_error(self, exc, value, tb):
+        """Exception dans un rappel de l'interface : journalisée (pas de console sous Haul.exe) et signalée."""
+        log.error("Erreur de l'interface", exc_info=(exc, value, tb))
+        try:
+            self._status(f"Erreur inattendue : {value or exc.__name__} (détails dans haul.log)", "error")
+        except Exception:
+            pass
+
     def _choose_folder(self):
         folder = filedialog.askdirectory(initialdir=self.folder_var.get() or os.path.expanduser("~"))
         if folder:
@@ -426,6 +579,45 @@ class App:
         os.makedirs(folder, exist_ok=True)
         os.startfile(folder)
 
+    # --- userscript et serveur local ---
+
+    def _port_busy(self):
+        owner = desktop.port_owner(PORT)
+        if owner and not owner.lower().startswith(("haul", "python")):
+            self._status(f"Port {PORT} occupé par {owner} : le navigateur ne peut pas envoyer les liens à Haul. "
+                         "Ferme ce programme puis relance Haul.", "error")
+        else:
+            self._status(f"Port {PORT} occupé{f' par {owner}' if owner else ''} : Haul est peut-être déjà lancé.",
+                         "warn")
+
+    def _refresh_script_label(self):
+        bundled = bundled_script_version()
+        seen = self.script_seen if self.script_seen is not None else self.cfg["script_version"]
+        prefix = f"Téléchargements FuckingFast · version {__version__} · "
+        if not seen:
+            text = "script navigateur jamais vu : « Installer le script navigateur »"
+        elif seen == "?" or (bundled and self._older(seen, bundled)):
+            text = f"script navigateur {'' if seen == '?' else seen + ' '}actif, mise à jour {bundled} proposée " \
+                   "par l'extension"
+        else:
+            text = f"script navigateur {seen} {'actif ✔' if self.script_seen else 'installé'}"
+        self.script_var.set(prefix + text)
+
+    @staticmethod
+    def _older(version, other):
+        def parts(v):
+            return tuple(int(p) for p in v.split(".") if p.isdigit())
+        return parts(version) < parts(other)
+
+    def _script_active(self, version):
+        version = version or "?"  # avant la 3.3, le script n'envoyait pas sa version
+        if version != self.script_seen:
+            self.script_seen = version
+            if self.cfg["script_version"] != version:
+                self.cfg["script_version"] = version
+                config.save(self.cfg)
+            self._refresh_script_label()
+
     def _script_outdated(self, kind):
         """Requête refusée : kind « missing » (script sans jeton) ou « wrong » (jeton écrit dans un script 3.1)."""
         if kind == "missing":
@@ -436,13 +628,48 @@ class App:
             self._status("Le script navigateur est en version 3.1 : mets-le à jour une dernière fois (« Installer le "
                          "script navigateur »). À partir de la 3.2, il se synchronise tout seul avec Haul.", "warn")
 
-    # --- notifications ---
+    # --- fenêtre, zone de notification, notifications ---
+
+    def _start_tray(self):
+        self.tray = desktop.Tray(ICON_PATH if ICON_PATH.exists() else None, "Haul",
+                                 lambda key: self.calls.put(lambda: self._tray_command(key)))
+        if not self.tray.hwnd:
+            self.tray = None
+
+    def _tray_command(self, key):
+        if key == "open":
+            self._show_window()
+        elif key == "suspend":
+            self._toggle_suspend()
+        elif key == "folder":
+            self._open_folder()
+        elif key == "quit":
+            self._show_window()
+            self._on_close()
+
+    def _tray_items(self):
+        return [("open", "Afficher Haul", True), None,
+                ("suspend", self._suspend_label(), self.suspend_btn.instate(["!disabled"])),
+                ("folder", "Ouvrir le dossier de destination", True), None, ("quit", "Quitter Haul", True)]
+
+    def _show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        desktop.bring_to_front(self.hwnd)
+
+    def _on_unmap(self, event):
+        # réduire la fenêtre la range dans la zone de notification
+        if event.widget is self.root and self.tray and self.root.state() == "iconic":
+            self.root.withdraw()
 
     def _alert(self, title, text, warning=False):
         """Prévient hors de la fenêtre (notification + bouton qui clignote) si elle n'est pas au premier plan."""
         if not self.notify_var.get() or notify.is_foreground(self.hwnd):
             return
         notify.flash(self.hwnd)
+        if self.tray and self.tray.balloon(title, text, warning):
+            return
         self.notifier.show(title, text, warning)
         if self.notification_timer:
             self.root.after_cancel(self.notification_timer)
@@ -454,7 +681,7 @@ class App:
         waiting = [self.jobs[i] for i, since in self.browser_since.items()
                    if now - since > CAPTCHA_ALERT_AFTER and i in self.jobs]
         for job in waiting:
-            if job.id not in self.captcha_alerted:
+            if job.id not in self.captcha_alerted and job.detail != NO_SCRIPT:
                 self.captcha_alerted.add(job.id)
                 self._alert("Captcha à valider", f"{job.name or job.url} attend dans ton navigateur.", warning=True)
 
@@ -480,14 +707,128 @@ class App:
         else:
             self.taskbar.set(tb.NONE)
 
-    # --- menu contextuel ---
+    def _warn_no_script(self, job):
+        if self.no_script_warned:
+            return
+        self.no_script_warned = True
+        self._status("Le script Haul ne répond pas dans le navigateur qui a ouvert la page : installe-le "
+                     "(« Installer le script navigateur ») dans ton navigateur par défaut, avec Violentmonkey ou "
+                     "Tampermonkey. La page attend encore quelques minutes.", "warn")
+        self._alert("Script navigateur absent ?", f"{job.name or job.url} : aucune nouvelle du script Haul.",
+                    warning=True)
+
+    # --- liste : groupes, tri, filtre ---
 
     def _job_at(self, y):
         iid = self.tree.identify_row(y)
-        return self.jobs.get(int(iid)) if iid else None
+        return self.jobs.get(int(iid)) if iid and iid.isdigit() else None
+
+    def _group_jobs(self, iid):
+        key = next((k for k, g in self.groups.items() if g == iid), None)
+        return [j for j in self.jobs.values() if postprocess.set_key(j) == key] if key else []
 
     def _selected_jobs(self):
-        return [self.jobs[int(iid)] for iid in self.tree.selection() if int(iid) in self.jobs]
+        jobs = {}
+        for iid in self.tree.selection():
+            for job in self._group_jobs(iid) if not iid.isdigit() else [self.jobs.get(int(iid))]:
+                if job:
+                    jobs[job.id] = job
+        return list(jobs.values())
+
+    def _mark_layout(self):
+        self.layout_dirty = True
+
+    def _sort_by(self, column):
+        """Clic sur un en-tête : tri croissant, décroissant, puis retour à l'ordre de la file."""
+        if not self.sort or self.sort[0] != column:
+            self.sort = (column, False)
+        elif not self.sort[1]:
+            self.sort = (column, True)
+        else:
+            self.sort = None
+        for col in COLUMNS:
+            arrow = (" ▼" if self.sort[1] else " ▲") if self.sort and self.sort[0] == col else ""
+            self.tree.heading(col, text=HEADINGS[col] + arrow)
+        self.layout_dirty = True
+
+    def _layout(self):
+        """Ordre, groupes et filtre de la liste.
+
+        Les volumes d'un même jeu sont rangés sous une ligne de groupe repliée qui résume leur
+        avancement ; sans tri, l'ordre est celui de la file (priorité).
+        """
+        self.layout_dirty = False
+        tree = self.tree
+        members = {}
+        for job in self.jobs.values():
+            key = postprocess.set_key(job)
+            if key and key[2]:
+                members.setdefault(key, []).append(job)
+        members = {k: v for k, v in members.items() if len(v) > 1}
+        for key in [k for k in self.groups if k not in members]:
+            iid = self.groups.pop(key)
+            for child in tree.get_children(iid):
+                tree.move(child, "", "end")
+            tree.delete(iid)
+        for key, jobs in members.items():
+            if key not in self.groups:
+                self.groups[key] = iid = f"g{self.next_group}"
+                self.next_group += 1
+                name = folder_name(jobs[0].name) or archive_base(jobs[0].name)
+                tree.insert("", "end", iid=iid, open=False, text=name)
+                self.columns_dirty = True
+        for job in self.jobs.values():
+            if not tree.exists(str(job.id)):
+                tree.insert("", "end", iid=str(job.id), **self._item(job))
+
+        query = self.filter_var.get().strip().lower()
+
+        def match(job):
+            return not query or query in (job.name or job.url).lower() or query in job.status.lower()
+
+        ordered = list(self.jobs.values())
+        if self.sort:
+            ordered.sort(key=sort_key(self.sort[0]), reverse=self.sort[1])
+        top, placed = [], set()
+        for job in ordered:
+            key = postprocess.set_key(job)
+            if key in self.groups:
+                if key not in placed:
+                    placed.add(key)
+                    visible = [str(j.id) for j in ordered if postprocess.set_key(j) == key and match(j)]
+                    if visible:
+                        top.append((self.groups[key], visible))
+            elif match(job):
+                top.append((str(job.id), None))
+        keep = {iid for iid, _ in top}
+        for iid in tree.get_children(""):
+            if iid not in keep:
+                tree.detach(iid)
+        for index, (iid, children) in enumerate(top):
+            tree.move(iid, "", index)
+            if children is not None:
+                for child in tree.get_children(iid):
+                    if child not in children:
+                        tree.detach(child)
+                for i, child in enumerate(children):
+                    tree.move(child, iid, i)
+                if query:
+                    tree.item(iid, open=True)
+        self._refresh_groups()
+
+    def _refresh_groups(self):
+        for key, iid in self.groups.items():
+            jobs = [j for j in self.jobs.values() if postprocess.set_key(j) == key]
+            if not jobs:
+                continue
+            kind, fraction, status, progress, speed, vt = group_summary(jobs)
+            name = folder_name(jobs[0].name) or archive_base(jobs[0].name)
+            tree_kind = kind if kind != "download" or fraction is not None else "busy"
+            self.tree.item(iid, text=f"{name}  ({plural(len(jobs), 'fichier')})",
+                           image=self.theme.status_icon(tree_kind, fraction, self.tick),
+                           values=(status, progress, speed, vt))
+
+    # --- menu contextuel ---
 
     def _context_menu(self, event):
         iid = self.tree.identify_row(event.y)
@@ -496,7 +837,9 @@ class App:
         if iid not in self.tree.selection():
             self.tree.selection_set(iid)
         jobs = self._selected_jobs()
-        job = self.jobs[int(iid)]
+        if not jobs:
+            return
+        job = self.jobs[int(iid)] if iid.isdigit() else jobs[0]
         m = self.menu
         m.delete(0, "end")
 
@@ -512,7 +855,11 @@ class App:
         pausable = [j for j in jobs if j.state in ACTIVE]
         item("Passer ce lien (pause)" if in_browser and len(jobs) == 1 else "Mettre en pause", self._pause, pausable)
         item("Reprendre", self._resume, [j for j in jobs if j.state == State.PAUSED])
-        item("Réessayer", self._retry, [j for j in jobs if j.state == State.ERROR])
+        item("Réessayer", self._retry, [j for j in jobs if j.state in (State.ERROR, State.RETRY)])
+        waiting = [j for j in jobs if j.state in (State.WAITING, State.QUEUED, State.PAUSED, State.RETRY)]
+        item("Placer en tête de file (Alt+↑)", lambda t: self._prioritize(t, True), waiting)
+        item("Placer en fin de file (Alt+↓)", lambda t: self._prioritize(t, False), waiting)
+        m.add_separator()
         item("Retirer de la liste", self._remove, [j for j in jobs if status_kind(j.state) != "busy"
                                                    or j.state == State.CONNECTING])
         m.tk_popup(event.x_root, event.y_root)
@@ -537,6 +884,19 @@ class App:
         self.last_seq = clipboard.sequence()  # ne pas relire ce qu'on vient de copier
         self._status(f"{plural(len(jobs), 'lien copié', 'liens copiés')}.", "ok")
 
+    def _prioritize(self, jobs, first=True):
+        """Place les fichiers en tête (ou en fin) de la file : pages à ouvrir et téléchargements en attente."""
+        if not jobs:
+            return
+        self.engine.prioritize(jobs, first)
+        ids = {j.id for j in jobs}
+        moved = [j for j in self.jobs.values() if j.id in ids]
+        rest = [j for j in self.jobs.values() if j.id not in ids]
+        self.jobs = {j.id: j for j in (moved + rest if first else rest + moved)}
+        self.layout_dirty = self.queue_dirty = True
+        if self.sort:
+            self._status("Ordre de la file modifié ; clique sur l'en-tête trié pour revenir à l'ordre de la file.")
+
     def _remove(self, jobs):
         """Retire de la liste ; un fichier en cours est d'abord mis en pause (le fichier partiel reste)."""
         for job in jobs:
@@ -548,7 +908,7 @@ class App:
             del self.jobs[job.id]
             self.seen.discard(page_key(job.url))  # pourra être ajouté de nouveau
             self.browser_since.pop(job.id, None)
-            self.columns_dirty = self.queue_dirty = True
+            self.columns_dirty = self.queue_dirty = self.layout_dirty = True
 
     def _pause(self, jobs):
         for job in jobs:
@@ -588,7 +948,7 @@ class App:
         paused = any(j.state == State.PAUSED for j in self.jobs.values())
         return "Tout reprendre" if self.suspended or (paused and not active) else "Tout suspendre"
 
-    # --- presse-papier ---
+    # --- presse-papier, fichiers déposés ---
 
     def _read_clipboard(self):
         try:
@@ -619,10 +979,20 @@ class App:
         elif not quiet:
             self._status("Aucun lien fuckingfast.co dans le presse-papier.", "warn")
 
+    def _add_from_files(self, paths):
+        """Fichiers déposés sur la fenêtre : page enregistrée, liste de liens, raccourci .url."""
+        text = "\n".join(dialogs.read_link_file(p) for p in paths if os.path.isfile(p))
+        if not self._add_links(text):
+            self._status("Aucun lien fuckingfast.co dans " + ("ce fichier." if len(paths) == 1 else "ces fichiers."),
+                         "warn")
+
     def _add_links(self, text):
         """Ajoute les liens trouvés ; retourne True s'il y en avait, même déjà connus."""
         urls = [m.group(0) for m in LINK_RE.finditer(text or "")]
-        added = sum(self._add_job(url) for url in urls)
+        # Les fichiers hors archive copiés avec un jeu (bonus, langues…) vont dans le dossier de ce jeu.
+        folders = [f for f in (folder_name(name_from_url(u)) for u in urls) if f]
+        game = max(set(folders), key=folders.count) if folders else None
+        added = sum(self._add_job(url, game=game) for url in urls)
         if added:
             self._status(f"{plural(added, 'lien ajouté', 'liens ajoutés')}.", "ok")
         elif urls:
@@ -633,12 +1003,20 @@ class App:
         self.seen.add(page_key(job.url))
         self.jobs[job.id] = job
         self.tree.insert("", "end", iid=str(job.id), **self._item(job))
-        self.columns_dirty = self.queue_dirty = True
+        self.columns_dirty = self.queue_dirty = self.layout_dirty = True
 
-    def _add_job(self, url, dl_url=None, user_agent=None):
+    def _destination(self, name, game=None):
+        """Dossier du fichier : un sous-dossier par jeu si le réglage est actif (nom de l'archive, sinon
+        `game`, le jeu copié en même temps)."""
+        folder = self.folder_var.get()
+        sub = (folder_name(name) or game) if self.subfolders_var.get() else None
+        return os.path.join(folder, sub) if sub else folder
+
+    def _add_job(self, url, dl_url=None, user_agent=None, game=None):
         if page_key(url) in self.seen:
             return False
-        job = Job(id=self.next_id, url=url, dest=self.folder_var.get(), name=name_from_url(url),
+        name = name_from_url(url)
+        job = Job(id=self.next_id, url=url, dest=self._destination(name, game), name=name,
                   dl_url=dl_url, user_agent=user_agent, state=State.PAUSED if self.suspended else State.WAITING)
         self.next_id += 1
         self._insert(job)
@@ -677,18 +1055,11 @@ class App:
 
     @staticmethod
     def _row(job):
-        if job.total and job.done >= job.total:
-            progress = human_size(job.total)
-        elif job.total:
-            done, total = human_size(job.done), human_size(job.total)
-            if done.split()[-1] == total.split()[-1]:
-                done = done.split()[0]  # « 312.0 / 500.0 Mo »
-            progress = f"{job.done * 100 // job.total} %  ·  {done} / {total}"
-        elif job.done:
-            progress = human_size(job.done)
-        else:
-            progress = ""
-        speed = f"{human_size(job.speed)}/s" if job.speed > 0 and job.state == State.DOWNLOADING else ""
+        progress = progress_label(job.done, job.total)
+        speed = ""
+        if job.speed > 0 and job.state == State.DOWNLOADING:
+            left = eta(job.done, job.total, job.speed)
+            speed = f"{human_size(job.speed)}/s" + (f"  ·  {duration(left)}" if left else "")
         return (job.status, progress, speed, job.vt)
 
     def _item(self, job):
@@ -731,15 +1102,21 @@ class App:
                     setattr(job, k, v)
                 if fields.keys() & {"state", "name", "vt", "detail"}:
                     self.columns_dirty = self.queue_dirty = changed = True
+                    if self.sort or self.filter_var.get():
+                        self.layout_dirty = True
                 if "state" in fields:
                     if job.state == State.BROWSER:
                         self.browser_since.setdefault(job.id, time.monotonic())
+                        if job.detail == NO_SCRIPT:
+                            self._warn_no_script(job)
                     else:
                         self.browser_since.pop(job.id, None)
                 if self.tree.exists(str(job_id)):
                     self.tree.item(str(job_id), **self._item(job))
         except queue.Empty:
             pass
+        if self.layout_dirty:
+            self._layout()
         kinds = self._refresh()
         self._watch_attention(kinds)
         if self.queue_dirty and time.monotonic() - self.last_queue_save > 2:
@@ -756,6 +1133,7 @@ class App:
             kinds[kind] = kinds.get(kind, 0) + 1
             if kind == "busy" or (kind == "download" and not job.total):
                 self.tree.item(str(job.id), image=self.theme.status_icon(kind, frame=self.tick))
+        self._refresh_groups()
         if self.status_kind == "busy":
             self._refresh_status_icon()
         if self.columns_dirty:
@@ -776,8 +1154,11 @@ class App:
             self.empty.place(relx=0.5, rely=0.5, anchor="center")
             self.summary_var.set("")
 
-        total = sum(j.speed for j in self.jobs.values() if j.state == State.DOWNLOADING)
-        self.total_var.set(f"↓ {human_size(total)}/s  ·  {total * 8 / 1e6:.0f} Mbit/s" if total else "")
+        downloading = [j for j in self.jobs.values() if j.state == State.DOWNLOADING]
+        total = sum(j.speed for j in downloading)
+        left = eta(sum(j.done for j in downloading if j.total), sum(j.total for j in downloading if j.total), total)
+        self.total_var.set(f"↓ {human_size(total)}/s  ·  {total * 8 / 1e6:.0f} Mbit/s"
+                           + (f"  ·  fin dans {duration(left)}" if left else "") if total else "")
 
         def enable(button, on):
             button.state(["!disabled"] if on else ["disabled"])
@@ -787,11 +1168,13 @@ class App:
             self.suspend_btn.configure(text=label)
         enable(self.suspend_btn, self.suspended or kinds.get("paused", 0) or any(
             j.state in ACTIVE for j in self.jobs.values()))
-        enable(self.retry_btn, any(j.state == State.ERROR for j in self.jobs.values()))
+        enable(self.retry_btn, any(j.state in (State.ERROR, State.RETRY) for j in self.jobs.values()))
         enable(self.clear_btn, kinds.get("done", 0))
         enable(self.clear_all_btn, self.jobs)
         enable(self.process_btn, not self.busy and any(j.state in ON_DISK for j in self.jobs.values()))
         enable(self.report_btn, self.last_report is not None)
+        if self.tray:
+            self.tray.items = self._tray_items()
         return kinds
 
     def _refresh_pause_button(self):
@@ -806,7 +1189,7 @@ class App:
 
     def _retry(self, jobs):
         for job in jobs:
-            if job.state == State.ERROR:
+            if job.state in (State.ERROR, State.RETRY):
                 self.engine.submit(job)
 
     def _retry_failed(self):
@@ -814,54 +1197,6 @@ class App:
 
     def _clear_done(self):
         self._remove([j for j in self.jobs.values() if status_kind(j.state) == "done"])
-
-    def _clear_all_dialog(self):
-        """Confirmation de « Tout supprimer » : vide la liste, et au choix les téléchargements inachevés."""
-        jobs = list(self.jobs.values())
-        if not jobs:
-            return
-        if getattr(self, "clear_window", None) and self.clear_window.winfo_exists():
-            self.clear_window.lift()
-            return
-        px = self.theme.px
-        active = sum(j.state in ACTIVE for j in jobs)
-        unfinished = sum(j.state not in ON_DISK for j in jobs)
-        busy = sum(j.state in (State.CHECKING, State.EXTRACTING) for j in jobs)
-        self.clear_window = win = tk.Toplevel(self.root)
-        win.title("Tout supprimer")
-        win.transient(self.root)
-        win.resizable(False, False)
-        self.theme.decorate(win)
-        card = ttk.Frame(win, style="Card.TFrame", padding=(px(20), px(16), px(20), px(18)))
-        card.pack(fill="both", expand=True, padx=px(16), pady=px(16))
-        ttk.Label(card, text=f"Vider la liste ({plural(len(jobs), 'fichier')}) ?", style="EmptyTitle.TLabel").pack(
-            anchor="w")
-        lines = []
-        if active:
-            lines.append("1 téléchargement en cours ou en attente sera arrêté." if active == 1
-                         else f"{active} téléchargements en cours ou en attente seront arrêtés.")
-        lines.append("Les fichiers terminés et extraits restent sur le disque.")
-        if busy:
-            lines.append(f"{plural(busy, 'fichier')} en cours d'analyse ou d'extraction reste dans la liste.")
-        ttk.Label(card, text="\n".join(lines), style="SurfaceMuted.TLabel", justify="left",
-                  wraplength=px(480)).pack(anchor="w", pady=(px(8), px(12)))
-        partial_var = tk.BooleanVar(value=False)
-        if unfinished:
-            ttk.Checkbutton(card, text="Supprimer aussi les téléchargements inachevés du disque (.part)",
-                            variable=partial_var, style="Switch.TCheckbutton").pack(anchor="w", pady=(0, px(16)))
-        buttons = ttk.Frame(card, style="Surface.TFrame")
-        buttons.pack(anchor="e")
-
-        def confirm(_event=None):
-            win.destroy()
-            self._clear_all(delete_partials=partial_var.get())
-
-        ttk.Button(buttons, text="Annuler", command=win.destroy).pack(side="left")
-        ttk.Button(buttons, text="Tout supprimer", style="Accent.TButton", command=confirm).pack(
-            side="left", padx=(px(8), 0))
-        win.bind("<Escape>", lambda e: win.destroy())
-        win.bind("<Return>", confirm)
-        win.focus_set()
 
     def _clear_all(self, delete_partials=False):
         jobs = [j for j in self.jobs.values() if j.state not in (State.CHECKING, State.EXTRACTING)]
@@ -881,14 +1216,15 @@ class App:
     def _postprocess(self, manual=False):
         """Analyse puis extrait les fichiers téléchargés.
 
-        En automatique : seulement quand toute la liste est finie, et une seule fois par fichier.
+        En automatique : chaque jeu dès que tous ses volumes de la liste sont téléchargés, une seule
+        fois par fichier (voir postprocess.ready_for_postprocess).
         """
         if self.busy or not self.jobs:
             return
-        if not manual and not all(j.state in ON_DISK for j in self.jobs.values()):
-            return  # téléchargements en cours, en attente, en pause ou en échec
-        batch = [j for j in self.jobs.values() if j.state in ON_DISK and j.path
-                 and (j.state != State.EXTRACTED if manual else not j.processed)]
+        if manual:
+            batch = [j for j in self.jobs.values() if j.state in ON_DISK and j.path and j.state != State.EXTRACTED]
+        else:
+            batch = postprocess.ready_for_postprocess(self.jobs.values())
         if not batch:
             if manual:
                 self._status("Rien à traiter : aucun fichier téléchargé en attente.")
@@ -907,190 +1243,27 @@ class App:
         threading.Thread(target=self._postprocess_worker, args=(batch, scan, winrar), daemon=True).start()
 
     def _postprocess_worker(self, batch, scan, winrar):
-        def put(job, **fields):
-            self.events.put((job.id, fields))
-
-        def set_state(job, state, detail=""):
-            put(job, state=state, detail=detail)
-
         def status(message, done=False, kind=None):
             self.events.put((None, {"message": message, "done": done, "kind": kind}))
 
-        if scan:
-            for job in batch:
-                put(job, vt="Analyse…")
-            status("Analyse VirusTotal en cours (quota gratuit : 4 requêtes/min, compte quelques minutes)…")
-            try:
-                report = postprocess.scan([j.path for j in batch], notify=status)
-            except Exception as e:
-                log.exception("Analyse VirusTotal impossible")
-                for job in batch:
-                    put(job, vt="non analysé", processed=False)  # à refaire une fois le problème réglé
-                if isinstance(e, postprocess.MissingApiKey):
-                    self.calls.put(self._api_key_dialog)
-                return status(f"Analyse VirusTotal impossible : {e}. Extraction non lancée.", done=True,
-                              kind="error")
-            self.last_report = report
-            report.save()
-            verdicts = report.verdicts()
-            blocking = []
-            for job in batch:
-                level, label = verdicts.get(os.path.normcase(job.path), ("error", "non analysé"))
-                put(job, vt=label)
-                if level in postprocess.BLOCKING_LEVELS:
-                    blocking.append(f"{job.name} : {label}")
-            if blocking:
-                log.warning("Extraction bloquée par l'analyse : %s", blocking)
-                if winrar:
-                    for job in batch:
-                        if job.name.lower().endswith(".rar"):
-                            set_state(job, State.BLOCKED, "Extraction bloquée : analyse VirusTotal")
-                more = f" (+{len(blocking) - 1})" if len(blocking) > 1 else ""
-                return status(f"Extraction bloquée — {blocking[0]}{more}. Clique « Rapport VirusTotal ».",
-                              done=True, kind="error")
-            if not winrar:
-                return status("Analyse VirusTotal terminée : rien de bloquant.", done=True)
-
-        todo = postprocess.archive_sets(batch)
-        if not todo:
-            return status("Rien de bloquant, aucune archive .rar à extraire.", done=True)
-        ok, failures = 0, []
-        for first, group in todo.items():
-            name = os.path.basename(first)
-            for job in group:
-                set_state(job, State.CHECKING)
-            status(f"Vérification de {name} avant extraction…")
-            try:
-                dest = postprocess.prepare_extraction(winrar, first)
-            except (postprocess.ExtractionBlocked, OSError, subprocess.SubprocessError) as e:
-                log.warning("Extraction de %s bloquée : %s", first, e)
-                for job in group:
-                    set_state(job, State.BLOCKED, f"Extraction bloquée : {e}")
-                failures.append(f"{name} : {e}")
-                continue
-            for job in group:
-                set_state(job, State.EXTRACTING)
-            status(f"Extraction de {name}…")
-            try:
-                code = postprocess.extract(winrar, first, dest)
-            except OSError as e:
-                log.exception("Extraction impossible")
-                code = str(e)
-            if code == 0:
-                ok += 1
-                where = os.path.relpath(dest, os.path.dirname(first))
-                detail = "" if where == "." else f"Extrait ✔ dans {where}{os.sep}"
-                for job in group:
-                    set_state(job, State.EXTRACTED, detail)
-            else:
-                failures.append(f"{name} : code {code}")
-                for job in group:
-                    set_state(job, State.EXTRACT_FAILED, f"Échec extraction (code {code})")
-        message = ("Analyse OK, " if scan else "") + f"extraction : {ok}/{len(todo)} archive(s) extraite(s)."
-        if failures:
-            message += f" Problème — {failures[0]}" + (f" (+{len(failures) - 1})" if len(failures) > 1 else "")
-        status(message, done=True, kind="ok" if ok == len(todo) else "warn" if ok else "error")
+        try:
+            postprocess.process(
+                batch, scan, winrar, lambda job, **fields: self.events.put((job.id, fields)), status,
+                delete_archives=self.cfg["delete_archives"],
+                on_report=lambda report: self.calls.put(lambda: setattr(self, "last_report", report)),
+                on_missing_key=lambda: self.calls.put(self._api_key_dialog))
+        except Exception as e:
+            log.exception("Analyse / extraction")
+            status(f"Analyse / extraction interrompue : {e}", done=True, kind="error")
 
     def _show_report(self):
         if not self.last_report:
             self._status("Aucune analyse VirusTotal pour l'instant.")
             return
-        c, px = self.theme.c, self.theme.px
-        win = tk.Toplevel(self.root)
-        win.title("Rapport VirusTotal")
-        win.geometry(f"{px(1000)}x{px(640)}")
-        self.theme.decorate(win)
-        card = ttk.Frame(win, style="Card.TFrame", padding=px(6))
-        card.pack(fill="both", expand=True, padx=px(16), pady=px(16))
-        card.columnconfigure(0, weight=1)
-        card.rowconfigure(0, weight=1)
-        text = tk.Text(card, font=self.theme.font_mono, wrap="none", background=c["card"], foreground=c["text"],
-                       selectbackground=c["accent_soft"], selectforeground=c["text"], insertbackground=c["text"],
-                       relief="flat", borderwidth=0, highlightthickness=0, padx=px(10), pady=px(8))
-        ys = ttk.Scrollbar(card, orient="vertical", command=text.yview)
-        xs = ttk.Scrollbar(card, orient="horizontal", command=text.xview)
-        text.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
-        text.grid(row=0, column=0, sticky="nsew")
-        ys.grid(row=0, column=1, sticky="ns")
-        xs.grid(row=1, column=0, sticky="ew")
-        text.insert("1.0", self.last_report.render_text())
-        text.configure(state="disabled")
+        dialogs.report_window(self)
 
     def _api_key_dialog(self):
-        """Saisie, test et enregistrement (chiffré) de la clé API VirusTotal."""
-        from vtzip.config import resolve_api_key, store_api_key
-
-        if getattr(self, "key_window", None) and self.key_window.winfo_exists():
-            self.key_window.lift()
-            return
-        px = self.theme.px
-        self.key_window = win = tk.Toplevel(self.root)
-        win.title("Clé API VirusTotal")
-        win.transient(self.root)
-        win.resizable(False, False)
-        self.theme.decorate(win)
-        card = ttk.Frame(win, style="Card.TFrame", padding=(px(20), px(16), px(20), px(18)))
-        card.pack(fill="both", expand=True, padx=px(16), pady=px(16))
-        card.columnconfigure(0, weight=1)
-        ttk.Label(card, text="CLÉ API VIRUSTOTAL", style="Caption.TLabel").grid(row=0, column=0, sticky="w")
-        key_var = tk.StringVar(value=resolve_api_key() or "")
-        entry = ttk.Entry(card, textvariable=key_var, show="•", width=72)
-        entry.grid(row=1, column=0, sticky="ew", pady=(px(6), px(10)))
-        show_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(card, text="Afficher la clé", variable=show_var, style="Switch.TCheckbutton",
-                        command=lambda: entry.configure(show="" if show_var.get() else "•")).grid(
-            row=2, column=0, sticky="w")
-        info = tk.StringVar(value="Clé gratuite : virustotal.com, menu de ton profil > API key. "
-                                  "Elle est enregistrée chiffrée, lisible seulement par ton compte Windows.")
-        ttk.Label(card, textvariable=info, style="SurfaceMuted.TLabel", wraplength=px(560), justify="left").grid(
-            row=3, column=0, sticky="w", pady=(px(12), px(16)))
-        buttons = ttk.Frame(card, style="Surface.TFrame")
-        buttons.grid(row=4, column=0, sticky="e")
-
-        def valid():
-            key = key_var.get().strip()
-            if len(key) != 64 or not key.isalnum():
-                info.set("Une clé VirusTotal fait 64 caractères (chiffres et lettres).")
-                return None
-            return key
-
-        def test():
-            key = valid()
-            if not key:
-                return
-            info.set("Test en cours…")
-            test_btn.state(["disabled"])
-
-            def run():
-                from vtzip.vt import VirusTotalClient, VTError
-                try:
-                    VirusTotalClient(key, rpm=0, timeout=20).lookup_hash(EICAR_SHA256)
-                    message = "Clé valide ✔"
-                except VTError as e:
-                    message = f"Échec : {e}"
-
-                def show():
-                    if win.winfo_exists():
-                        info.set(message)
-                        test_btn.state(["!disabled"])
-                self.calls.put(show)
-            threading.Thread(target=run, daemon=True).start()
-
-        def save(_event=None):
-            key = valid()
-            if not key:
-                return
-            store_api_key(key)
-            win.destroy()
-            self._status("Clé VirusTotal enregistrée.", "ok")
-
-        ttk.Button(buttons, text="Obtenir une clé", command=lambda: os.startfile(VT_KEY_URL)).pack(side="left")
-        test_btn = ttk.Button(buttons, text="Tester", command=test)
-        test_btn.pack(side="left", padx=(px(8), 0))
-        ttk.Button(buttons, text="Enregistrer", style="Accent.TButton", command=save).pack(side="left", padx=(px(8), 0))
-        entry.bind("<Return>", save)
-        win.bind("<Escape>", lambda e: win.destroy())
-        entry.focus_set()
+        dialogs.api_key_dialog(self)
 
     def _on_close(self):
         active = [j for j in self.jobs.values() if j.state in ACTIVE]
@@ -1110,6 +1283,8 @@ class App:
         if self.server:
             self.server.shutdown()
         self.notifier.remove()
+        if self.tray:
+            self.tray.stop()
         self.taskbar.set(notify.TaskbarProgress.NONE)
         for timer in (*self.timers.values(), self.notification_timer):
             if timer:

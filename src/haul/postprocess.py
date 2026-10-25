@@ -341,16 +341,19 @@ def unique_path(path):
 def place_extracted(tmp, first_volume):
     """Range le contenu extrait dans `tmp` sans rien écraser ; retourne le dossier où il se trouve.
 
-    - dossier propre au jeu (il ne contient que ses volumes) : le contenu y va directement ;
+    - dossier propre au jeu (créé par « Un dossier par jeu », ou qui ne contient que ses volumes) : le
+      contenu y va directement, à côté des fichiers bonus (fg-optional-*.bin) téléchargés avec le jeu ;
     - tout le contenu dans un seul dossier : ce dossier, à côté de l'archive ;
     - sinon : un sous-dossier au nom du jeu.
     Un nom déjà pris reçoit un suffixe « (2) » : une version précédente (sauvegardes, réglages) reste intacte.
     """
     folder = os.path.dirname(first_volume)
+    name = os.path.basename(first_volume)
     tops = os.listdir(tmp)
     others = [n for n in os.listdir(folder)
               if os.path.join(folder, n) != tmp and not same_set(first_volume, n)]
-    if not others and not any(os.path.lexists(os.path.join(folder, t)) for t in tops):
+    dedicated = not others or os.path.basename(folder) == folder_name(name)
+    if dedicated and not any(os.path.lexists(os.path.join(folder, t)) for t in tops):
         for t in tops:
             os.replace(os.path.join(tmp, t), os.path.join(folder, t))
         os.rmdir(tmp)
@@ -360,7 +363,6 @@ def place_extracted(tmp, first_volume):
         os.replace(os.path.join(tmp, tops[0]), target)
         os.rmdir(tmp)
         return target
-    name = os.path.basename(first_volume)
     target = unique_path(os.path.join(folder, folder_name(name) or archive_base(name)))
     os.replace(tmp, target)
     return target
@@ -415,7 +417,7 @@ def recycle(paths):
         op.wFunc = 3  # FO_DELETE
         op.pFrom = ctypes.cast(buf, ctypes.c_void_p)
         op.fFlags = 0x40 | 0x10 | 0x4 | 0x400  # ALLOWUNDO | NOCONFIRMATION | SILENT | NOERRORUI
-        shell32 = ctypes.windll.shell32
+        shell32 = ctypes.WinDLL("shell32")  # instance privée : argtypes sans effet sur ctypes.windll
         shell32.SHFileOperationW.argtypes = [ctypes.POINTER(SHFILEOPSTRUCTW)]
         code = shell32.SHFileOperationW(ctypes.byref(op))
         return code == 0 and not op.fAnyOperationsAborted and not any(os.path.exists(p) for p in paths)
