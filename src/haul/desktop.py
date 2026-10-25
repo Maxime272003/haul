@@ -51,6 +51,23 @@ def single_instance():
         return True  # pas de mutex possible : on ne bloque pas le lancement
 
 
+def wait_process(pid, timeout=30):
+    """Attend la fin d'un processus (ancienne instance après une mise à jour), au plus `timeout` s."""
+    try:
+        kernel32 = _dll("kernel32")
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if handle:
+            try:
+                kernel32.WaitForSingleObject(handle, int(timeout * 1000))
+            finally:
+                kernel32.CloseHandle(handle)
+    except (OSError, AttributeError):
+        pass
+
+
 def allow_foreground():
     """Autorise l'instance déjà lancée à passer au premier plan (sinon Windows fait juste clignoter son bouton)."""
     try:

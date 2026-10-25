@@ -64,7 +64,17 @@ par un jeton secret propre à ton installation (voir [Sécurité](#sécurité)).
 - Windows 10/11, [WinRAR](https://www.win-rar.com/) (pour l'extraction et le listage des RAR)
 - Un navigateur avec [Violentmonkey](https://violentmonkey.github.io/) ou Tampermonkey
 - Une clé API VirusTotal gratuite (profil > *API key* sur [virustotal.com](https://www.virustotal.com))
-- Python 3.10+ pour lancer depuis les sources ou construire l'exécutable
+- Python 3.10+ seulement pour lancer depuis les sources ou construire l'exécutable
+
+### Installation (recommandé)
+
+Télécharge **[Haul.exe](https://github.com/Maxime272003/haul/releases/latest/download/Haul.exe)**
+(dernière release) et place-le où tu veux, par exemple dans un dossier `Haul` de tes documents :
+aucun Python requis. Haul se met ensuite à jour tout seul : il cherche une nouvelle version au
+lancement puis toutes les 6 h, la télécharge en arrière-plan (empreinte SHA-256 vérifiée) et
+l'installe quand tu le quittes, ou tout de suite avec **Redémarrer pour mettre à jour**. Réglage
+*Mises à jour automatiques* pour désactiver. Place l'exécutable dans un dossier où tu peux écrire
+(pas `C:\Program Files`), sinon il ne pourra pas se remplacer.
 
 ### Depuis les sources
 
@@ -81,6 +91,8 @@ py -3.12 -m venv .venv
 ```powershell
 .\scripts\build.ps1                    # produit dist\Haul.exe (aucun Python requis pour l'utiliser)
 ```
+
+Lancé depuis les sources, Haul signale seulement qu'une nouvelle version est disponible.
 
 ### Première utilisation
 
@@ -107,6 +119,7 @@ py -3.12 -m venv .venv
 | Notifications | Prévient quand la fenêtre n'est pas au premier plan : captcha à valider, script navigateur muet, liste terminée, extraction terminée ou bloquée. |
 | Icône dans la zone de notification | Icône permanente (clic : afficher, clic droit : suspendre, dossier, quitter) ; réduire la fenêtre l'y range. |
 | Démarrer avec Windows | Lance Haul à l'ouverture de session, réduit dans la zone de notification. |
+| Mises à jour automatiques | Télécharge les nouvelles versions et les installe en quittant Haul. |
 
 Boutons :
 
@@ -248,6 +261,15 @@ enregistrée en clair par une version précédente est chiffrée à la première
 ```
 
 vtzip reste utilisable seul : `.venv\Scripts\vtzip --deep C:\chemin\du\dossier`.
+
+### Releases
+
+Chaque fusion sur `main` publie une release (`.github/workflows/ci.yml`, job *release*) : tests,
+construction de `Haul.exe`, puis release `vX.Y.Z` avec `Haul.exe` et `Haul.exe.sha256`, notes
+générées depuis les pull requests. Le numéro incrémente le correctif de la release précédente
+(`scripts/next_version.py`) ; pour passer à 1.1.0 ou 2.0.0, change `__version__` dans
+`src/haul/__init__.py` avant de fusionner. Le dépôt doit être public : Haul lit les releases sans
+jeton.
 
 ### Mesurer le débit
 
