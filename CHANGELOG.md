@@ -33,6 +33,10 @@ Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), ver
   simultanés est ramené à ce que le serveur accepte, jusqu'à ce qu'un téléchargement se termine.
 
 ### Modifié
+- Réglages moins encombrés : la fenêtre ne garde que ceux de tous les jours et un résumé de ce qui
+  suit le téléchargement ; les autres sont dans *Réglages…*, par section, chacun expliqué.
+- En-tête : l'état du script navigateur ne passe plus sous les boutons (texte raccourci, retour à
+  la ligne, boutons sous le titre quand la fenêtre est étroite).
 - Extraction par UnRAR, sans fenêtre, dans un dossier temporaire renommé à la fin : les volumes ne
   sont lus qu'une fois (le test d'intégrité séparé disparaît, les CRC sont vérifiés pendant
   l'extraction), un échec ne laisse rien. Avancement en pourcentage dans la liste.

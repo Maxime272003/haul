@@ -105,6 +105,11 @@ Lancé depuis les sources, Haul signale seulement qu'une nouvelle version est di
 
 ## Utilisation
 
+La fenêtre ne montre que les réglages de tous les jours (dossier, presse-papier, fichiers
+simultanés, connexions, débit) et, en dessous, ce que Haul fait des fichiers téléchargés. Les
+autres sont dans **Réglages…**, rangés en trois sections (téléchargement, après le téléchargement,
+application), chacun avec une phrase qui dit ce qu'il fait.
+
 | Réglage | Effet |
 | --- | --- |
 | Surveiller le presse-papier | Ajoute automatiquement les liens copiés. |

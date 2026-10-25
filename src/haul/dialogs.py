@@ -98,6 +98,63 @@ def links_dialog(app):
     text.focus_set()
 
 
+# (titre de section, [(libellé, variable de l'App, rappel de l'App, description)])
+SETTINGS = (
+    ("TÉLÉCHARGEMENT", [
+        ("Un dossier par jeu", "subfolders_var", "_switch_changed",
+         "Chaque jeu dans un sous-dossier à son nom, avec les fichiers bonus copiés en même temps."),
+    ]),
+    ("APRÈS LE TÉLÉCHARGEMENT", [
+        ("Analyser avec VirusTotal", "scan_var", "_switch_changed",
+         "Empreinte des fichiers et des exécutables dans les archives, sans rien envoyer. Un fichier "
+         "malveillant, suspect ou non vérifié bloque l'extraction."),
+        ("Extraire avec WinRAR", "extract_var", "_switch_changed",
+         "Chaque jeu dès que ses volumes sont téléchargés. Rien d'existant n'est écrasé."),
+        ("Archives à la corbeille après extraction", "delete_var", "_switch_changed",
+         "Les volumes partent à la corbeille une fois l'extraction réussie."),
+    ]),
+    ("APPLICATION", [
+        ("Notifications", "notify_var", "_switch_changed",
+         "Captcha à valider, script navigateur muet, téléchargements ou extraction terminés."),
+        ("Icône dans la zone de notification", "tray_var", "_switch_changed",
+         "Réduire la fenêtre la range près de l'horloge ; clic droit pour suspendre ou quitter."),
+        ("Démarrer avec Windows", "autostart_var", "_autostart_changed",
+         "Haul se lance à l'ouverture de session, réduit dans la zone de notification."),
+        ("Mises à jour automatiques", "update_var", "_switch_changed",
+         "Les nouvelles versions sont téléchargées et installées quand tu quittes Haul."),
+    ]),
+)
+
+
+def settings_dialog(app):
+    """Réglages moins courants, rangés par section, chacun avec ce qu'il fait."""
+    win = _window(app, "settings_window", "Réglages")
+    if not win:
+        return
+    px = app.theme.px
+    card = _card(app, win)
+    card.columnconfigure(0, weight=1)
+    row = 0
+    for section, (title, options) in enumerate(SETTINGS):
+        ttk.Label(card, text=title, style="Caption.TLabel").grid(
+            row=row, column=0, columnspan=2, sticky="w", pady=(px(18) if section else 0, px(4)))
+        row += 1
+        for label, var, command, description in options:
+            ttk.Checkbutton(card, text=label, variable=getattr(app, var), style="Switch.TCheckbutton",
+                            command=getattr(app, command)).grid(row=row, column=0, sticky="w", pady=(px(8), 0))
+            if var == "scan_var":
+                ttk.Button(card, text="Clé VirusTotal…", command=lambda: api_key_dialog(app)).grid(
+                    row=row, column=1, sticky="e", pady=(px(8), 0), padx=(px(16), 0))
+            ttk.Label(card, text=description, style="SurfaceMuted.TLabel", wraplength=px(500), justify="left").grid(
+                row=row + 1, column=0, columnspan=2, sticky="w", padx=(px(46), 0))
+            row += 2
+    ttk.Button(card, text="Fermer", style="Accent.TButton", command=win.destroy).grid(
+        row=row, column=0, columnspan=2, sticky="e", pady=(px(20), 0))
+    win.bind("<Escape>", lambda e: win.destroy())
+    win.bind("<Return>", lambda e: win.destroy())
+    win.focus_set()
+
+
 def clear_all_dialog(app):
     """Confirmation de « Tout supprimer » : vide la liste, et au choix les téléchargements inachevés."""
     jobs = list(app.jobs.values())
