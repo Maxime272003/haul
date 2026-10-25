@@ -49,7 +49,7 @@ End-to-end flow: clipboard (HTML format, `clipboard.py` + `links.py`), dropped f
 
 **Persistence** (`paths.py`): everything lives in `%APPDATA%\Haul` (`config.json`, `queue.json`, `haul.log`, `reports/`), never next to the exe. JSON files are written atomically via `.tmp` + `replace`. `config.load()` only accepts keys present in `DEFAULTS` with the same type — add new settings to `DEFAULTS`. Bundled assets resolve through `sys._MEIPASS` when frozen.
 
-`gui.py` is the large Tk `App` (list grouped by volume set, sortable, filterable — `_layout()` rebuilds order/groups when `layout_dirty`); `dialogs.py` holds secondary windows; `theme.py` (light/dark palette, ttk styles, drawn shapes/PNG generation) and `widgets.py` (fluid layout, steppers, tooltips) support it; `notify.py` wraps Win32 notifications and taskbar progress.
+`gui.py` is the large Tk `App` (list grouped by volume set, sortable, filterable — `_layout()` rebuilds order/groups when `layout_dirty`); `dialogs.py` holds secondary windows (incl. the "Réglages…" window, driven by its `SETTINGS` table of App variables and callbacks); `theme.py` (light/dark palette, ttk styles, drawn shapes/PNG generation) and `widgets.py` (fluid layout, steppers, tooltips) support it; `notify.py` wraps Win32 notifications and taskbar progress.
 
 ## Conventions
 

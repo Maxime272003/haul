@@ -276,7 +276,19 @@ class App:
         self.engine.set_connections(self.cfg["connections"])
         self.engine.set_max_speed(self.cfg["max_speed"] << 20)
 
+    def _refresh_pipeline(self):
+        """Résumé, sous les options, de ce que Haul fait des fichiers téléchargés (détails dans Réglages)."""
+        scan, extract = self.scan_var.get(), self.extract_var.get()
+        steps = (["analyse VirusTotal"] if scan else []) + (["extraction WinRAR"] if extract else [])
+        text = "Après le téléchargement : " + (", puis ".join(steps) if steps else "rien, fichiers laissés tels quels")
+        if extract and self.delete_var.get():
+            text += ", archives à la corbeille"
+        if self.subfolders_var.get():
+            text += " · un dossier par jeu"
+        self.pipeline_var.set(text + ".")
+
     def _switch_changed(self):
+        self._refresh_pipeline()
         self._save_config()
         if self.tray_var.get() and not self.tray:
             self._start_tray()
@@ -329,9 +341,29 @@ class App:
             ttk.Label(header, image=self.logo).grid(row=0, column=0, rowspan=2, padx=(0, px(12)))
         ttk.Label(header, text="Haul", style="Title.TLabel").grid(row=0, column=1, sticky="sw")
         self.script_var = tk.StringVar()
-        ttk.Label(header, textvariable=self.script_var, style="Muted.TLabel").grid(row=1, column=1, sticky="nw")
+        subtitle = ttk.Label(header, textvariable=self.script_var, style="Muted.TLabel", justify="left")
+        subtitle.grid(row=1, column=1, sticky="nw", padx=(0, px(16)))
         buttons = ttk.Frame(header)
         buttons.grid(row=0, column=2, rowspan=2, sticky="e")
+
+        def wrap(_event=None):
+            # Le sous-titre passe à la ligne au lieu de passer sous les boutons ; fenêtre étroite :
+            # les boutons passent sous le titre.
+            width = header.winfo_width()
+            if width <= 1:
+                return
+            free = width - buttons.winfo_reqwidth() - subtitle.winfo_x() - px(16)
+            below = free < px(300)
+            if below != self.header_buttons_below:
+                self.header_buttons_below = below
+                if below:
+                    buttons.grid(row=2, column=0, columnspan=3, sticky="w", pady=(px(12), 0))
+                else:
+                    buttons.grid(row=0, column=2, rowspan=2, columnspan=1, sticky="e", pady=0)
+            subtitle.configure(wraplength=max(px(160), width - subtitle.winfo_x() - px(16) if below else free))
+        self.header_buttons_below = False
+        header.bind("<Configure>", wrap)
+        buttons.bind("<Configure>", wrap)
         # affiché quand une nouvelle version est téléchargée (voir _update_ready)
         self.update_btn = ttk.Button(buttons, style="Accent.TButton", command=lambda: self._on_close(restart=True))
         self.script_btn = ttk.Button(buttons, text="Installer le script navigateur",
@@ -361,7 +393,10 @@ class App:
                                                              pady=px(14))
 
         opts = Flow(card, gap=px(28), row_gap=px(10), style="Surface.TFrame")
-        opts.grid(row=3, column=0, columnspan=3, sticky="ew")
+        opts.grid(row=3, column=0, columnspan=2, sticky="ew")
+        # le reste (analyse, extraction, application) est dans la fenêtre Réglages
+        ttk.Button(card, text="Réglages…", command=lambda: dialogs.settings_dialog(self)).grid(
+            row=3, column=2, sticky="ne", padx=(px(8), 0))
         self.watch_var = tk.BooleanVar(value=self.cfg["watch"])
         self.parallel_var = tk.StringVar(value=str(self.cfg["parallel"]))
         self.conn_var = tk.StringVar(value=str(self.cfg["connections"]))
@@ -376,8 +411,6 @@ class App:
         self.autostart_var = tk.BooleanVar(value=desktop.autostart_enabled())
         self.update_var = tk.BooleanVar(value=self.cfg["auto_update"])
 
-        def switch(text, var, command=self._switch_changed):
-            return ttk.Checkbutton(opts, text=text, variable=var, style="Switch.TCheckbutton", command=command)
 
         def labelled(text, make):
             box = ttk.Frame(opts, style="Surface.TFrame")
@@ -393,16 +426,14 @@ class App:
         speed_box, self.speed_stepper = labelled("Débit max", lambda box: ChoiceStepper(
             box, self.speed_var, [speed_label(v) for v in SPEED_CHOICES], command=self._settings_changed,
             style="Surface.TFrame"))
-        opts.add(switch("Surveiller le presse-papier", self.watch_var), parallel, conns, speed_box,
-                 switch("Un dossier par jeu", self.subfolders_var),
-                 switch("Analyser avec VirusTotal", self.scan_var),
-                 ttk.Button(opts, text="Clé VirusTotal…", command=self._api_key_dialog),
-                 switch("Puis extraire avec WinRAR", self.extract_var),
-                 switch("Archives à la corbeille après extraction", self.delete_var),
-                 switch("Notifications", self.notify_var),
-                 switch("Icône dans la zone de notification", self.tray_var),
-                 switch("Démarrer avec Windows", self.autostart_var, self._autostart_changed),
-                 switch("Mises à jour automatiques", self.update_var))
+        watch = ttk.Checkbutton(opts, text="Surveiller le presse-papier", variable=self.watch_var,
+                                style="Switch.TCheckbutton", command=self._switch_changed)
+        opts.add(watch, parallel, conns, speed_box)
+        self.pipeline_var = tk.StringVar()
+        pipeline = ttk.Label(card, textvariable=self.pipeline_var, style="SurfaceMuted.TLabel", justify="left")
+        pipeline.grid(row=4, column=0, columnspan=3, sticky="w", pady=(px(12), 0))
+        card.bind("<Configure>", lambda e: pipeline.configure(wraplength=max(px(200), e.width - px(40))), add="+")
+        self._refresh_pipeline()
         return card
 
     def _build_list_header(self, parent):
@@ -609,10 +640,9 @@ class App:
         seen = self.script_seen if self.script_seen is not None else self.cfg["script_version"]
         prefix = f"Téléchargements FuckingFast · version {__version__} · "
         if not seen:
-            text = "script navigateur jamais vu : « Installer le script navigateur »"
+            text = "script navigateur non détecté"
         elif seen == "?" or (bundled and self._older(seen, bundled)):
-            text = f"script navigateur {'' if seen == '?' else seen + ' '}actif, mise à jour {bundled} proposée " \
-                   "par l'extension"
+            text = f"script navigateur {'' if seen == '?' else seen + ' '}actif, mise à jour {bundled} en attente"
         else:
             text = f"script navigateur {seen} {'actif ✔' if self.script_seen else 'installé'}"
         self.script_var.set(prefix + text)
@@ -1234,7 +1264,12 @@ class App:
                     parts.append(f"{n} {text}")
             self.summary_var.set("  ·  ".join(parts))
         else:
-            self.empty.place(relx=0.5, rely=0.5, anchor="center")
+            # message de liste vide seulement s'il tient sous les en-têtes de colonnes
+            room = self.tree.winfo_height() - self.theme.px(48)
+            if room >= self.empty.winfo_reqheight():
+                self.empty.place(relx=0.5, rely=0.5, anchor="center")
+            else:
+                self.empty.place_forget()
             self.summary_var.set("")
 
         downloading = [j for j in self.jobs.values() if j.state == State.DOWNLOADING]
@@ -1317,6 +1352,7 @@ class App:
         if extract and not winrar:
             self._status("WinRAR introuvable : extraction impossible.", "error")
             self.extract_var.set(False)
+            self._refresh_pipeline()
         if not scan and not winrar:
             return
         for job in batch:
